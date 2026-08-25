@@ -1,0 +1,1539 @@
+library(readr)
+library(readxl)
+library(dplyr)
+library(purrr)
+library(DESeq2)
+library(VennDiagram)
+library(grid)
+library(writexl)
+
+# ============================================================
+# 1. IMPORT COUNTS
+# ============================================================
+
+count_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "RNA_raw_data/miRNA_counts_read-20260315T063300Z-1-001/",
+  "miRNA_counts_read"
+)
+
+OCC_count <- read_delim(
+  "\\\\wsl.localhost\\Ubuntu-24.04\\home\\rhablase\\EGA\\OCC_count.txt",
+  delim = "\t",
+  show_col_types = FALSE
+)
+
+EEC_count <- read.csv(
+  "\\\\wsl.localhost\\Ubuntu-24.04\\home\\rhablase\\EGA\\EEC_count.csv",
+  check.names = FALSE
+)
+
+mirna_files <- list.files(
+  count_dir,
+  pattern = "_miRNA_counts\\.txt$",
+  full.names = TRUE
+)
+
+stopifnot(length(mirna_files) > 0)
+
+count_list <- map(mirna_files, function(f) {
+  read_tsv(
+    f,
+    comment = "#",
+    show_col_types = FALSE
+  ) %>%
+    select(-any_of(c(
+      "Chr", "Start", "End", "Strand", "Length"
+    )))
+})
+
+count_df <- purrr::reduce(
+  count_list,
+  dplyr::full_join,
+  by = "Geneid"
+) %>%
+  dplyr::full_join(OCC_count, by = "Geneid") %>%
+  dplyr::full_join(EEC_count, by = "Geneid")
+
+
+
+count_df[is.na(count_df)] <- 0
+count_df <- as.data.frame(count_df)
+
+stopifnot(!anyDuplicated(count_df$Geneid))
+
+rownames(count_df) <- count_df$Geneid
+count_df$Geneid <- NULL
+
+# Remove an additional annotation column if present
+count_df$gene <- NULL
+
+miRNA_count_matrix <- as.matrix(count_df)
+storage.mode(miRNA_count_matrix) <- "numeric"
+
+stopifnot(
+  all(miRNA_count_matrix >= 0),
+  all(miRNA_count_matrix == round(miRNA_count_matrix))
+)
+
+
+clean_sample_names <- function(x) {
+  x <- trimws(x)
+  x <- gsub("SRR\\s+", "SRR", x)
+  x <- gsub("^Aligned_reads/", "", x)
+  x <- gsub("^Aligned_", "", x)
+  x <- gsub("\\.bam$", "", x)
+  x <- gsub("_fully_cleaned\\.sorted$", "", x)
+  x <- gsub("\\.sorted$", "", x)
+  x <- gsub("_R1_001$", "", x)
+  x <- gsub("_cleaned$", "", x)
+  x <- gsub("_fully$", "", x)
+  x <- gsub("/", "_", x)
+  x <- gsub("\\.", "_", x)
+  x
+}
+
+colnames(miRNA_count_matrix) <-
+  clean_sample_names(colnames(miRNA_count_matrix))
+
+colnames(miRNA_count_matrix) <- sub(
+  ".*_(SRR[0-9]+)$",
+  "\\1",
+  colnames(miRNA_count_matrix)
+)
+
+stopifnot(
+  !anyDuplicated(colnames(miRNA_count_matrix)),
+  !anyDuplicated(rownames(miRNA_count_matrix))
+)
+
+miRNA_metadata <- read_excel(
+  paste0(
+    "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+    "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+    "RNA_raw_data/miRNA_metadata.xlsx"
+  )
+)
+
+miRNA_metadata <- as.data.frame(miRNA_metadata)
+
+miRNA_metadata$`Sample id` <-
+  clean_sample_names(miRNA_metadata$`Sample id`)
+
+stopifnot(
+  !anyDuplicated(miRNA_metadata$`Sample id`)
+)
+
+# These must both return character(0)
+setdiff(
+  colnames(miRNA_count_matrix),
+  miRNA_metadata$`Sample id`
+)
+
+setdiff(
+  miRNA_metadata$`Sample id`,
+  colnames(miRNA_count_matrix)
+)
+
+metadata_order <- match(
+  colnames(miRNA_count_matrix),
+  miRNA_metadata$`Sample id`
+)
+
+stopifnot(!anyNA(metadata_order))
+
+miRNA_metadata <- miRNA_metadata[
+  metadata_order,
+  ,
+  drop = FALSE
+]
+
+rownames(miRNA_metadata) <-
+  miRNA_metadata$`Sample id`
+
+stopifnot(
+  identical(
+    colnames(miRNA_count_matrix),
+    rownames(miRNA_metadata)
+  )
+)
+
+table(miRNA_metadata$Type, miRNA_metadata$batch)
+
+miRNA_min_counts <- 5
+
+miRNA_min_samples <- ceiling(
+  0.10 * ncol(miRNA_count_matrix)
+)
+
+miRNA_keep <- rowSums(
+  miRNA_count_matrix >= miRNA_min_counts
+) >= miRNA_min_samples
+
+miRNA_count_matrix_filtered <-
+  miRNA_count_matrix[
+    miRNA_keep,
+    ,
+    drop = FALSE
+  ]
+
+
+dataset_samples <- split(
+  seq_len(ncol(miRNA_count_matrix)),
+  miRNA_metadata$batch
+)
+
+miRNA_filtering_summary <- data.frame(
+  dataset = names(dataset_samples),
+  
+  number_of_samples = lengths(dataset_samples),
+  
+  miRNAs_before_filtering = sapply(
+    dataset_samples,
+    function(i) sum(
+      rowSums(miRNA_count_matrix[, i, drop = FALSE]) > 0
+    )
+  ),
+  
+  miRNAs_after_filtering = sapply(
+    dataset_samples,
+    function(i) sum(
+      rowSums(miRNA_count_matrix_filtered[, i, drop = FALSE]) > 0
+    )
+  ),
+  
+  row.names = NULL
+)
+
+dim(miRNA_count_matrix_filtered)
+miRNA_metadata$Condition <- factor(
+  miRNA_metadata$Condition,
+  levels = c("Normal", "Cancer")
+)
+
+miRNA_metadata$batch <- factor(
+  miRNA_metadata$batch
+)
+
+stopifnot(
+  !anyNA(miRNA_metadata$Condition),
+  !anyNA(miRNA_metadata$batch)
+)
+
+table(
+  miRNA_metadata$batch,
+  miRNA_metadata$Condition
+)
+
+design_check <- model.matrix(
+  ~ batch + Condition,
+  data = miRNA_metadata
+)
+
+stopifnot(
+  qr(design_check)$rank == ncol(design_check)
+)
+
+dds_miRNA <- DESeqDataSetFromMatrix(
+  countData = miRNA_count_matrix_filtered,
+  colData = miRNA_metadata,
+  design = ~ batch + Condition
+)
+
+dds_miRNA <- DESeq(dds_miRNA)
+
+res_miRNA_EAOC <- results(
+  dds_miRNA,
+  contrast = c(
+    "Condition",
+    "Cancer",
+    "Normal"
+  ),
+  alpha = 0.05
+)
+
+res_miRNA_EAOC_df <-
+  as.data.frame(res_miRNA_EAOC)
+
+res_miRNA_EAOC_df$miRNA <-
+  rownames(res_miRNA_EAOC_df)
+
+res_miRNA_EAOC_df <- res_miRNA_EAOC_df[
+  order(res_miRNA_EAOC_df$padj, na.last = TRUE),
+]
+
+sig_res_miRNA_EAOC <- res_miRNA_EAOC_df %>%
+  dplyr::filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) > 1
+  )
+
+upregulated_miRNA <- sig_res_miRNA_EAOC %>%
+  filter(log2FoldChange > 1)
+
+downregulated_miRNA <- sig_res_miRNA_EAOC %>%
+  filter(log2FoldChange < -1)
+
+nrow(sig_res_miRNA_EAOC)
+nrow(upregulated_miRNA)
+nrow(downregulated_miRNA)
+miRNA_filtering_summary
+miRNA_before_filtering<- as.data.frame(miRNA_count_matrix)
+miRNA_after_filtering <- as.data.frame(miRNA_count_matrix_filtered)
+
+
+stopifnot(
+  nrow(upregulated_miRNA) +
+    nrow(downregulated_miRNA) ==
+    nrow(sig_res_miRNA_EAOC)
+)
+
+# Export to excel 
+
+miRNA_before_filtering <- as.data.frame(
+  miRNA_count_matrix
+) %>%
+  tibble::rownames_to_column(
+    "miRNA"
+  )
+
+miRNA_after_filtering <- as.data.frame(
+  miRNA_count_matrix_filtered
+) %>%
+  tibble::rownames_to_column(
+    "miRNA"
+  )
+
+openxlsx::write.xlsx(
+  list(
+    "Significant miRNAs" = sig_res_miRNA_EAOC,
+    "Upregulated miRNAs" = upregulated_miRNA,
+    "Downregulated miRNAs" = downregulated_miRNA,
+    "Dataset filtering summary" = miRNA_filtering_summary,
+    "miRNAs before filtering" = miRNA_before_filtering,
+    "miRNAs after filtering" = miRNA_after_filtering
+  ),
+  
+  file = file.path(
+    "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/First revesion/Supplementary_material/Supplementary_material",
+    "miRNA_analysis_summary.xlsx"
+  ),
+  
+  overwrite = TRUE
+)
+
+
+#LODO
+
+# ============================================================
+# LEAVE-ONE-DATASET-OUT ANALYSIS
+# ============================================================
+
+miRNA_datasets <- levels(
+  droplevels(miRNA_metadata$batch)
+)
+
+LOSO_miRNA_results <- list()
+LOSO_miRNA_significant <- list()
+
+LOSO_miRNA_summary <- data.frame(
+  excluded_dataset = character(),
+  remaining_samples = integer(),
+  remaining_cancer = integer(),
+  remaining_normal = integer(),
+  significant_miRNAs = integer(),
+  upregulated = integer(),
+  downregulated = integer(),
+  log2FC_correlation = numeric(),
+  directional_concordance = numeric(),
+  model_status = character(),
+  stringsAsFactors = FALSE
+)
+
+for (excluded_dataset in miRNA_datasets) {
+  
+  message("Excluding: ", excluded_dataset)
+  
+  # Exclude one dataset
+  keep_samples <-
+    miRNA_metadata$batch != excluded_dataset
+  
+  counts_sub <- miRNA_count_matrix_filtered[
+    ,
+    keep_samples,
+    drop = FALSE
+  ]
+  
+  metadata_sub <- miRNA_metadata[
+    keep_samples,
+    ,
+    drop = FALSE
+  ]
+  
+  metadata_sub$batch <- droplevels(
+    metadata_sub$batch
+  )
+  
+  metadata_sub$Condition <- droplevels(
+    metadata_sub$Condition
+  )
+  
+  stopifnot(
+    identical(
+      colnames(counts_sub),
+      rownames(metadata_sub)
+    )
+  )
+  
+  # Both conditions must remain
+  if (nlevels(metadata_sub$Condition) < 2) {
+    
+    warning(
+      excluded_dataset,
+      ": only one condition remains; model skipped."
+    )
+    
+    LOSO_miRNA_summary <- rbind(
+      LOSO_miRNA_summary,
+      data.frame(
+        excluded_dataset = excluded_dataset,
+        remaining_samples = ncol(counts_sub),
+        remaining_cancer =
+          sum(metadata_sub$Condition == "Cancer"),
+        remaining_normal =
+          sum(metadata_sub$Condition == "Normal"),
+        significant_miRNAs = NA_integer_,
+        upregulated = NA_integer_,
+        downregulated = NA_integer_,
+        log2FC_correlation = NA_real_,
+        directional_concordance = NA_real_,
+        model_status = "Skipped: one condition",
+        stringsAsFactors = FALSE
+      )
+    )
+    
+    next
+  }
+  
+  # Check whether batch and condition remain estimable
+  design_sub <- model.matrix(
+    ~ batch + Condition,
+    data = metadata_sub
+  )
+  
+  if (qr(design_sub)$rank < ncol(design_sub)) {
+    
+    warning(
+      excluded_dataset,
+      ": batch and condition are confounded; model skipped."
+    )
+    
+    LOSO_miRNA_summary <- rbind(
+      LOSO_miRNA_summary,
+      data.frame(
+        excluded_dataset = excluded_dataset,
+        remaining_samples = ncol(counts_sub),
+        remaining_cancer =
+          sum(metadata_sub$Condition == "Cancer"),
+        remaining_normal =
+          sum(metadata_sub$Condition == "Normal"),
+        significant_miRNAs = NA_integer_,
+        upregulated = NA_integer_,
+        downregulated = NA_integer_,
+        log2FC_correlation = NA_real_,
+        directional_concordance = NA_real_,
+        model_status = "Skipped: rank-deficient design",
+        stringsAsFactors = FALSE
+      )
+    )
+    
+    next
+  }
+  
+  # Fit DESeq2 model
+  dds_sub <- DESeqDataSetFromMatrix(
+    countData = counts_sub,
+    colData = metadata_sub,
+    design = ~ batch + Condition
+  )
+  
+  dds_sub <- DESeq(
+    dds_sub,
+    quiet = TRUE
+  )
+  
+  res_sub <- results(
+    dds_sub,
+    contrast = c(
+      "Condition",
+      "Cancer",
+      "Normal"
+    ),
+    alpha = 0.05
+  )
+  
+  res_sub <- as.data.frame(res_sub)
+  res_sub$miRNA <- rownames(res_sub)
+  res_sub$excluded_dataset <- excluded_dataset
+  
+  sig_sub <- res_sub %>%
+    dplyr::filter(
+      !is.na(padj),
+      padj < 0.05,
+      abs(log2FoldChange) > 1
+    )
+  
+  LOSO_miRNA_results[[excluded_dataset]] <- res_sub
+  LOSO_miRNA_significant[[excluded_dataset]] <- sig_sub
+  
+  # Compare LOSO effect sizes with the full analysis
+  common_miRNAs <- intersect(
+    rownames(res_miRNA_EAOC_df),
+    rownames(res_sub)
+  )
+  
+  full_logFC <- res_miRNA_EAOC_df[
+    common_miRNAs,
+    "log2FoldChange"
+  ]
+  
+  sub_logFC <- res_sub[
+    common_miRNAs,
+    "log2FoldChange"
+  ]
+  
+  valid <- is.finite(full_logFC) &
+    is.finite(sub_logFC)
+  
+  log2FC_correlation <- cor(
+    full_logFC[valid],
+    sub_logFC[valid],
+    method = "spearman"
+  )
+  
+  directional_concordance <- mean(
+    sign(full_logFC[valid]) ==
+      sign(sub_logFC[valid])
+  )
+  
+  LOSO_miRNA_summary <- rbind(
+    LOSO_miRNA_summary,
+    data.frame(
+      excluded_dataset = excluded_dataset,
+      remaining_samples = ncol(counts_sub),
+      remaining_cancer =
+        sum(metadata_sub$Condition == "Cancer"),
+      remaining_normal =
+        sum(metadata_sub$Condition == "Normal"),
+      significant_miRNAs = nrow(sig_sub),
+      upregulated =
+        sum(sig_sub$log2FoldChange > 1),
+      downregulated =
+        sum(sig_sub$log2FoldChange < -1),
+      log2FC_correlation = log2FC_correlation,
+      directional_concordance =
+        directional_concordance,
+      model_status = "Completed",
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+LOSO_miRNA_summary
+
+View(LOSO_miRNA_summary)
+
+LOSO_miRNA_all_iterations <- dplyr::bind_rows(
+  LOSO_miRNA_results
+)
+
+LOSO_miRNA_significant_iterations <- dplyr::bind_rows(
+  LOSO_miRNA_significant
+)
+
+openxlsx::write.xlsx(
+  list(
+    "LOSO summary" = LOSO_miRNA_summary,
+    "All iteration results" = LOSO_miRNA_all_iterations,
+    "Significant miRNAs" = LOSO_miRNA_significant_iterations
+  ),
+  
+  file = file.path(
+    "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/First revesion/Supplementary_material/Supplementary_material",
+    "miRNA_LOSO_sensitivity_analysis.xlsx"
+  ),
+  
+  overwrite = TRUE
+)
+
+
+############################################################
+## Publication-ready PCA of batch-adjusted miRNA expression
+############################################################
+
+
+############################################################
+## 1. Load required packages
+############################################################
+
+library(DESeq2)
+library(limma)
+library(ggplot2)
+library(ggpubr)
+
+
+############################################################
+## 2. Generate variance-stabilised expression values
+############################################################
+
+vsd <- DESeq2::varianceStabilizingTransformation(
+  dds_miRNA,
+  blind = FALSE
+)
+
+
+############################################################
+## 3. Preserve disease status during batch adjustment
+############################################################
+
+condition_design <- model.matrix(
+  ~ Condition,
+  data = as.data.frame(
+    SummarizedExperiment::colData(vsd)
+  )
+)
+
+batch_corrected_expression <- limma::removeBatchEffect(
+  x = SummarizedExperiment::assay(vsd),
+  
+  batch = SummarizedExperiment::colData(
+    vsd
+  )$batch,
+  
+  design = condition_design
+)
+
+
+############################################################
+## 4. Select the 500 most variable miRNAs
+############################################################
+
+miRNA_variance <- matrixStats::rowVars(
+  batch_corrected_expression
+)
+
+number_variable_miRNAs <- min(
+  500,
+  nrow(batch_corrected_expression)
+)
+
+selected_miRNAs <- order(
+  miRNA_variance,
+  decreasing = TRUE
+)[
+  seq_len(
+    number_variable_miRNAs
+  )
+]
+
+
+############################################################
+## 5. Perform PCA
+############################################################
+
+pca_result <- stats::prcomp(
+  t(
+    batch_corrected_expression[
+      selected_miRNAs,
+      ,
+      drop = FALSE
+    ]
+  ),
+  
+  center = TRUE,
+  
+  scale. = FALSE
+)
+
+variance_explained <- 100 *
+  pca_result$sdev^2 /
+  sum(
+    pca_result$sdev^2
+  )
+
+
+############################################################
+## 6. Prepare plotting data
+############################################################
+
+pca_metadata <- as.data.frame(
+  SummarizedExperiment::colData(vsd)
+)
+
+pca_data <- data.frame(
+  sample_id = rownames(pca_metadata),
+  
+  PC1 = pca_result$x[, 1],
+  
+  PC2 = pca_result$x[, 2],
+  
+  Condition = as.character(
+    pca_metadata$Condition
+  ),
+  
+  Type = as.character(
+    pca_metadata$Type
+  ),
+  
+  Dataset = as.character(
+    pca_metadata$batch
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+pca_data$Histotype <- dplyr::case_when(
+  pca_data$Condition == "Normal" ~ "Normal",
+  
+  pca_data$Type %in% c(
+    "EC",
+    "EEC",
+    "EnOC"
+  ) ~ "EnOC",
+  
+  pca_data$Type %in% c(
+    "OCC",
+    "OCCC"
+  ) ~ "OCCC",
+  
+  TRUE ~ pca_data$Type
+)
+
+pca_data$Histotype <- factor(
+  pca_data$Histotype,
+  
+  levels = c(
+    "Normal",
+    "EnOC",
+    "OCCC"
+  )
+)
+
+stopifnot(
+  identical(
+    rownames(pca_result$x),
+    pca_data$sample_id
+  ),
+  
+  !anyNA(
+    pca_data$Histotype
+  ),
+  
+  !anyNA(
+    pca_data$Dataset
+  )
+)
+
+
+############################################################
+## 7. Define colours and shapes
+############################################################
+
+histotype_colours <- c(
+  "Normal" = "#2F6690",
+  
+  "EnOC" = "#D1495B",
+  
+  "OCCC" = "#2A9D8F"
+)
+
+dataset_colours <- c(
+  "EGAD00001009636" = "#D1495B",
+  
+  "GSE134289" = "#2F6690",
+  
+  "GSE200852" = "#2A9D8F",
+  
+  "GSE230956" = "#8E44AD",
+  
+  "GSE261800" = "#E9A23B"
+)
+
+histotype_shapes <- c(
+  "Normal" = 21,
+  
+  "EnOC" = 22,
+  
+  "OCCC" = 24
+)
+
+missing_datasets <- setdiff(
+  unique(
+    pca_data$Dataset
+  ),
+  
+  names(
+    dataset_colours
+  )
+)
+
+if (
+  length(missing_datasets) > 0
+) {
+  stop(
+    "No colours defined for: ",
+    
+    paste(
+      missing_datasets,
+      collapse = ", "
+    )
+  )
+}
+
+
+############################################################
+## 8. Define a clean publication theme
+############################################################
+
+pca_theme <- ggplot2::theme_classic(
+  base_size = 13
+) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      
+      size = 15,
+      
+      hjust = 0.5,
+      
+      margin = ggplot2::margin(
+        b = 12
+      )
+    ),
+    
+    axis.title = ggplot2::element_text(
+      face = "bold",
+      
+      size = 12
+    ),
+    
+    axis.text = ggplot2::element_text(
+      colour = "grey20",
+      
+      size = 11
+    ),
+    
+    axis.line = ggplot2::element_line(
+      linewidth = 0.6,
+      
+      colour = "grey30"
+    ),
+    
+    legend.title = ggplot2::element_text(
+      face = "bold"
+    ),
+    
+    legend.text = ggplot2::element_text(
+      size = 10
+    ),
+    
+    legend.key = ggplot2::element_blank(),
+    
+    panel.grid.major = ggplot2::element_line(
+      colour = "grey93",
+      
+      linewidth = 0.3
+    ),
+    
+    panel.grid.minor = ggplot2::element_blank(),
+    
+    plot.margin = ggplot2::margin(
+      12,
+      18,
+      12,
+      12
+    )
+  )
+
+
+############################################################
+## 9. Panel A: PCA coloured by histotype
+## No ellipses
+############################################################
+
+pca_histotype_plot <- ggplot2::ggplot(
+  pca_data,
+  
+  ggplot2::aes(
+    x = PC1,
+    
+    y = PC2
+  )
+) +
+  
+  ggplot2::geom_hline(
+    yintercept = 0,
+    
+    colour = "grey75",
+    
+    linetype = "dashed",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_vline(
+    xintercept = 0,
+    
+    colour = "grey75",
+    
+    linetype = "dashed",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_point(
+    ggplot2::aes(
+      fill = Histotype,
+      
+      shape = Histotype
+    ),
+    
+    colour = "grey20",
+    
+    stroke = 0.4,
+    
+    size = 3.8,
+    
+    alpha = 0.90
+  ) +
+  
+  ggplot2::scale_fill_manual(
+    values = histotype_colours,
+    
+    name = "Histotype"
+  ) +
+  
+  ggplot2::scale_shape_manual(
+    values = histotype_shapes,
+    
+    name = "Histotype"
+  ) +
+  
+  ggplot2::labs(
+    title = "miRNA expression by histotype",
+    
+    x = sprintf(
+      "PC1 (%.1f%% variance)",
+      
+      variance_explained[1]
+    ),
+    
+    y = sprintf(
+      "PC2 (%.1f%% variance)",
+      
+      variance_explained[2]
+    )
+  ) +
+  
+  pca_theme
+
+
+############################################################
+## 10. Panel B: PCA coloured by dataset
+## Ellipse colours indicate histotype
+############################################################
+
+pca_dataset_plot <- ggplot2::ggplot(
+  pca_data,
+  
+  ggplot2::aes(
+    x = PC1,
+    
+    y = PC2
+  )
+) +
+  
+  ggplot2::geom_hline(
+    yintercept = 0,
+    
+    colour = "grey75",
+    
+    linetype = "dashed",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_vline(
+    xintercept = 0,
+    
+    colour = "grey75",
+    
+    linetype = "dashed",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::stat_ellipse(
+    ggplot2::aes(
+      colour = Histotype,
+      
+      group = Histotype
+    ),
+    
+    geom = "path",
+    
+    type = "norm",
+    
+    level = 0.80,
+    
+    linewidth = 1,
+    
+    show.legend = TRUE
+  ) +
+  
+  ggplot2::geom_point(
+    ggplot2::aes(
+      fill = Dataset,
+      
+      shape = Histotype
+    ),
+    
+    colour = "grey20",
+    
+    stroke = 0.4,
+    
+    size = 3.5,
+    
+    alpha = 0.9
+  ) +
+  
+  ggplot2::scale_fill_manual(
+    name = "Dataset",
+    
+    values = dataset_colours
+  ) +
+  
+  ggplot2::scale_colour_manual(
+    name = "Histotype ellipse",
+    
+    values = histotype_colours
+  ) +
+  
+  ggplot2::scale_shape_manual(
+    name = "Histotype",
+    
+    values = histotype_shapes
+  ) +
+  
+  ggplot2::guides(
+    fill = ggplot2::guide_legend(
+      order = 1,
+      
+      override.aes = list(
+        shape = 21,
+        
+        colour = "grey20",
+        
+        size = 3.5,
+        
+        alpha = 1
+      )
+    ),
+    
+    shape = ggplot2::guide_legend(
+      order = 2,
+      
+      override.aes = list(
+        fill = "grey60",
+        
+        colour = "grey20",
+        
+        size = 3.5,
+        
+        alpha = 1
+      )
+    ),
+    
+    colour = ggplot2::guide_legend(
+      order = 3,
+      
+      override.aes = list(
+        linewidth = 1.2
+      )
+    )
+  ) +
+  
+  ggplot2::labs(
+    title = "miRNA expression by dataset",
+    
+    x = sprintf(
+      "PC1 (%.1f%% variance)",
+      
+      variance_explained[1]
+    ),
+    
+    y = sprintf(
+      "PC2 (%.1f%% variance)",
+      
+      variance_explained[2]
+    )
+  ) +
+  
+  pca_theme +
+  
+  ggplot2::theme(
+    legend.position = "right",
+    
+    legend.box = "vertical"
+  )
+############################################################
+## 11. Combine both panels
+############################################################
+
+combined_pca_publication <- ggpubr::ggarrange(
+  pca_histotype_plot,
+  
+  pca_dataset_plot,
+  
+  labels = c(
+    "A",
+    "B"
+  ),
+  
+  ncol = 2,
+  
+  widths = c(
+    1,
+    1.6
+  ),
+  
+  font.label = list(
+    size = 16,
+    
+    face = "bold"
+  )
+)
+
+print(
+  combined_pca_publication
+)
+
+
+############################################################
+## 12. Save the combined figure
+############################################################
+
+image_directory <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  
+  "The PhD File/Brunel PhD/Bioinformatics/",
+  
+  "EAOC_Paper/Biochemistry submission/",
+  
+  "First revesion/Submission images"
+)
+
+stopifnot(
+  dir.exists(
+    image_directory
+  )
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    image_directory,
+    
+    "miRNA_PCA_publication.png"
+  ),
+  
+  plot = combined_pca_publication,
+  
+  width = 15,
+  
+  height = 6.5,
+  
+  units = "in",
+  
+  dpi = 600,
+  
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    image_directory,
+    
+    "miRNA_PCA_publication.pdf"
+  ),
+  
+  plot = combined_pca_publication,
+  
+  width = 15,
+  
+  height = 6.5,
+  
+  units = "in",
+  
+  device = grDevices::cairo_pdf,
+  
+  bg = "white"
+)
+#####################################################
+# Predicted targets for DEMs
+#####################################################
+
+dim(sig_res_miRNA_EAOC)
+rownames(sig_res_miRNA_EAOC)
+
+sig_res_miRNA_EAOC$miRNA<-rownames(sig_res_miRNA_EAOC)
+EAOC_miRNAs <- sig_res_miRNA_EAOC$miRNA
+
+# Query predicted targets from all databases
+pred <- get_multimir(mirna = EAOC_miRNAs,
+                     table = "predicted",
+                     summary = FALSE)
+
+# Convert to data frame
+pred_EAOC_miRNA <- as.data.frame(pred@data)
+
+# removes rows identical across all columns
+pred_EAOC_miRNA <- pred_EAOC_miRNA %>%
+  distinct()  
+
+# Check the number of databases called 
+colnames(pred_EAOC_miRNA)
+levels(factor(pred_EAOC_miRNA$database))
+
+# Create KEGG genes 
+
+# Get pathway data
+pathway <- keggGet("hsa04150")
+
+# Check contents
+names(pathway[[1]])
+
+# Extract gene list
+genes_info <- pathway[[1]]$GENE
+
+gene_info<-as.data.frame(genes_info)
+
+# Odd elements = KEGG gene IDs (Entrez IDs)
+entrez_ids <- genes_info[seq(1, length(genes_info), 2)]
+
+# Even elements = symbol + description
+symbols_descr <- genes_info[seq(2, length(genes_info), 2)]
+
+# Extract only the gene symbols (before the semicolon)
+gene_symbols <- sub(";.*", "", symbols_descr)
+gene_symbols <- trimws(gene_symbols)
+gene_symbols<- gene_symbols[gene_symbols != "[KO:K20396]"]
+mtor_pathway <- as.data.frame(gene_symbols)
+
+# Ensure gene columns are character
+pred_EAOC_miRNA$target_symbol <- as.character(pred_EAOC_miRNA$target_symbol)
+mtor_pathway$gene_symbols <- as.character(mtor_pathway$gene_symbols )
+sig_genes_EAOC$external_gene_name <- as.character(sig_genes_EAOC$external_gene_name)
+
+sig_genes_EAOCs <- readxl::read_excel(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/First revesion/Supplementary_material/Supplementary_material/sig_genes_EAOC.xlsx"
+)
+
+sig_genes_EAOC<- as.data.frame(sig_genes_EAOCs)
+colnames(sig_genes_EAOC)
+
+gene_names <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = unique(
+    sub("\\..*$", "", sig_genes_EAOC$ensembl_gene_id)
+  ),
+  keytype = "ENSEMBL",
+  columns = "SYMBOL"
+) %>%
+  dplyr::rename(
+    ensembl_gene_id = ENSEMBL,
+    external_gene_name = SYMBOL
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    .keep_all = TRUE
+  )
+
+sig_genes_EAOC <- sig_genes_EAOC %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      ensembl_gene_id
+    )
+  ) %>%
+  dplyr::left_join(
+    gene_names,
+    by = "ensembl_gene_id"
+  )
+
+
+mTOR_pathway_EAOC <- sig_genes_EAOC[
+  sig_genes_EAOC$external_gene_name %in% mtor_pathway$gene_symbols,
+  ,
+  drop = FALSE
+]
+
+
+# Perform many-to-many inner join (duplicates preserved)
+EAOC_pred_mTOR_all <- inner_join(
+  pred_EAOC_miRNA,
+  mTOR_pathway_EAOC,
+  by = c("target_symbol" = "external_gene_name"),
+  relationship = "many-to-many"  # explicit in dplyr ≥1.1.0
+)
+
+# Keep only 4 databases 
+reliable_dbs <- c("targetscan", "mirdb", "miranda", "diana_microt")
+
+# Subset the targets that belong to theses databases 
+EAOC_pred_mTOR_reliable <- EAOC_pred_mTOR_all %>%
+  dplyr::filter(tolower(database) %in% reliable_dbs)
+
+unique(EAOC_pred_mTOR_reliable$database)
+
+colnames(EAOC_pred_mTOR_reliable_multi_unique)
+#########################################################
+# Now the validated once 
+########################################################
+
+val  <- get_multimir(mirna   = EAOC_miRNAs,
+                     table   = "validated",
+                    summary = FALSE)
+EAOC_val_df <- val@data
+
+EAOC_val_df <- EAOC_val_df %>%
+  mutate(pair_id = paste(mature_mirna_id, target_symbol, sep = " -> "))
+
+common_pairs <- intersect(
+  EAOC_pred_mTOR_reliable_multi_unique$pair_id,
+  EAOC_val_df$pair_id
+)
+
+EAOC_val_common <- EAOC_val_df %>%
+  dplyr::filter(pair_id %in% common_pairs)
+
+colnames(EAOC_val_common)
+
+# creat final mtor-mirna interactions table before applying the inverse relation ship role
+
+
+
+collapse_unique <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & trimws(x) != ""]
+  paste(sort(unique(x)), collapse = "; ")
+}
+
+EAOC_val_summary <- EAOC_val_common %>%
+  group_by(pair_id) %>%
+  summarise(
+    mature_mirna_acc = collapse_unique(mature_mirna_acc),
+    mature_mirna_id  = collapse_unique(mature_mirna_id),
+    target_symbol    = collapse_unique(target_symbol),
+    target_entrez    = collapse_unique(target_entrez),
+    target_ensembl   = collapse_unique(target_ensembl),
+    databases        = collapse_unique(database),
+    experiments      = collapse_unique(experiment),
+    pubmed_ids       = collapse_unique(pubmed_id),
+    support_types    = collapse_unique(support_type),
+    evidence_types   = collapse_unique(type),
+    validation_records = n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::select(
+    mature_mirna_acc,
+    mature_mirna_id,
+    target_symbol,
+    target_entrez,
+    target_ensembl,
+    databases,
+    experiments,
+    pubmed_ids,
+    support_types,
+    evidence_types,
+    validation_records,
+    pair_id
+  )
+
+
+colnames(EAOC_val_summary )
+
+
+
+EAOC_val_summary <- EAOC_val_summary %>%
+  mutate(
+    target_ensembl = case_when(
+      target_symbol == "SESN2"   ~ "ENSG00000130766",
+      target_symbol == "RPS6KA1" ~ "ENSG00000117676",
+      target_symbol == "AKT3"    ~ "ENSG00000117020",
+      TRUE                       ~ target_ensembl
+    )
+  )
+
+
+
+#Join the miRNA data
+
+# 1. Prepare miRNA results table for joining
+EAOC_sig_miRNA_info <- sig_res_miRNA_EAOC %>%
+  mutate(mature_mirna_id = miRNA) %>%
+  dplyr::select(
+    mature_mirna_id,
+    miRNA_baseMean = baseMean,
+    miRNA_log2FoldChange = log2FoldChange,
+    miRNA_lfcSE = lfcSE,
+    miRNA_stat = stat,
+    miRNA_pvalue = pvalue,
+    miRNA_padj = padj
+  )
+
+# 2. Join miRNA results into validated mTOR table
+EAOC_val_summary <- EAOC_val_summary %>%
+  left_join(EAOC_sig_miRNA_info, by = "mature_mirna_id")
+
+colnames(EAOC_val_summary)
+colnames(sig_genes_EAOC)
+
+
+EAOC_val_summary_joined <- sig_genes_EAOC %>%
+  rename_with(
+    ~ paste0("mRNA_", .x),
+    -ensembl_gene_id
+  ) %>%
+  right_join(
+    EAOC_val_summary,
+    by = c("ensembl_gene_id" = "target_ensembl")
+  )
+
+
+
+EAOC_val_summary_joined <- EAOC_val_summary_joined %>%
+  left_join(
+    EAOC_pred_mTOR_reliable_multi_unique %>%
+      dplyr::select(pair_id, databases, support_n),
+    by = "pair_id"
+  )
+
+
+colnames(EAOC_val_summary_joined)
+
+
+# Now add direction of regulation 
+EAOC_val_summary_joined <- EAOC_val_summary_joined %>%
+  mutate(
+    gene_direction = case_when(
+      mRNA_logFC < 0 ~ "Downregulated",
+      mRNA_logFC > 0 ~ "Upregulated",
+      TRUE ~ "No change"
+    ),
+    miRNA_direction = case_when(
+      miRNA_log2FoldChange < 0 ~ "Downregulated",
+      miRNA_log2FoldChange > 0 ~ "Upregulated",
+      TRUE ~ "No change"
+    )
+  )
+
+
+#Inverse pairs 
+
+EAOC_final_inverse_pairs <- EAOC_val_summary_joined %>%
+  dplyr::filter(
+    (miRNA_direction == "Upregulated" & gene_direction == "Downregulated") |
+      (miRNA_direction == "Downregulated" & gene_direction == "Upregulated")
+  )
+
+any(duplicated(EAOC_final_inverse_pairs$pair_id))
+
+nrow(EAOC_final_inverse_pairs)
+head(EAOC_final_inverse_pairs)
+
+colnames(EAOC_final_inverse_pairs)
+
+
+openxlsx::write.xlsx(
+  EAOC_final_inverse_pairs,
+  file = "EAOC_final_inverse_pairs.xlsx",
+  overwrite = TRUE
+)
+
+getwd()
+
+
+EAOC_gene_list <- unique(EAOC_final_inverse_pairs$target_symbol)
+
+
+
+
+length(EAOC_gene_list)
+head(EAOC_gene_list)
+
+EAOC_miRNA_list <- unique(EAOC_final_inverse_pairs$mature_mirna_id)
+
+length(EAOC_miRNA_list)
+head(EAOC_miRNA_list)
+
+# calculate the degree centrality 
+
+colnames(EAOC_final_inverse_pairs)
+
+unique_pairs <- EAOC_final_inverse_pairs %>%
+  distinct(mature_mirna_id, target_symbol)
+
+network_summary <- unique_pairs %>%
+  summarise(
+    unique_miRNAs = n_distinct(mature_mirna_id),
+    unique_target_genes = n_distinct(target_symbol),
+    unique_pairs = n()
+  )
+
+network_summary
+
+miRNA_degree <- unique_pairs %>%
+  group_by(node = mature_mirna_id) %>%
+  summarise(
+    node_type = "miRNA",
+    degree_centrality = n_distinct(target_symbol),
+    .groups = "drop"
+  )
+
+gene_degree <- unique_pairs %>%
+  group_by(node = target_symbol) %>%
+  summarise(
+    node_type = "mTOR pathway gene",
+    degree_centrality = n_distinct(mature_mirna_id),
+    .groups = "drop"
+  )
+
+EAOC_degree_centrality <- bind_rows(
+  miRNA_degree,
+  gene_degree
+) %>%
+  arrange(desc(degree_centrality), node_type, node)
+
+EAOC_degree_centrality
+
+openxlsx::write.xlsx(
+  EAOC_degree_centrality,
+  file = "degree_centrality_of_all_nodes.xlsx",
+  overwrite = TRUE
+)
+
+cytoscape_edges <- EAOC_final_inverse_pairs %>%
+  dplyr::select(
+    source = mature_mirna_id,
+    target = target_symbol
+  ) %>%
+  dplyr::distinct()
+
+openxlsx::write.xlsx(
+  cytoscape_edges,
+  file = "EAOC_Cytoscape_network_edges.xlsx",
+  overwrite = TRUE
+)
