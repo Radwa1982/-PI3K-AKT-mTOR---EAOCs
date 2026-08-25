@@ -1,0 +1,1906 @@
+############################################################
+# SUPPLEMENTARY QUALITY-CONTROL AND SENSITIVITY ANALYSES
+#
+# Required existing objects:
+#   expr_raw  = log2-transformed data before normalization
+#   expr_norm = normalized expression matrix
+#   meta      = sample metadata
+############################################################
+
+library(ggplot2)
+library(dplyr)
+library(limma)
+library(reshape2)
+library(openxlsx)
+library(patchwork)
+library(PCAtools)
+
+# Output folder
+output_dir <- "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/First revesion/Supplementary_material/Supplementary_material/Supplementary _material_figures"
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(output_dir, showWarnings = FALSE)
+
+
+############################################################
+# 1. ALIGN EXPRESSION MATRICES WITH METADATA
+############################################################
+
+# Standardise sample identifiers
+colnames(expr_raw)  <- gsub("\\.", "-", colnames(expr_raw))
+colnames(expr_norm) <- gsub("\\.", "-", colnames(expr_norm))
+meta$sample_id      <- gsub("\\.", "-", meta$sample_id)
+
+# Check expression matrices
+stopifnot(
+  identical(colnames(expr_raw), colnames(expr_norm))
+)
+
+# Check that metadata IDs are unique
+stopifnot(!anyDuplicated(meta$sample_id))
+
+# Reorder metadata to match expression matrices
+meta_aligned <- meta[
+  match(colnames(expr_norm), meta$sample_id),
+  ,
+  drop = FALSE
+]
+
+# Confirm successful matching
+stopifnot(
+  !anyNA(meta_aligned$sample_id),
+  identical(colnames(expr_norm), meta_aligned$sample_id)
+)
+
+table(meta_aligned$condition)
+table(meta_aligned$batch_1)
+table(meta_aligned$source)
+
+
+
+# Package versions
+R.version.string
+
+packageVersion("stats")
+packageVersion("graphics")
+packageVersion("reshape2")
+packageVersion("ggplot2")
+packageVersion("patchwork")
+packageVersion("dplyr")
+
+############################################################
+# 2. PCA FUNCTIONS
+############################################################
+
+run_pca <- function(expression_matrix, metadata) {
+  
+  expression_matrix <- as.matrix(expression_matrix)
+  metadata <- as.data.frame(metadata)
+  
+  # Confirm that metadata columns are uniquely named
+  if (anyDuplicated(colnames(metadata))) {
+    stop(
+      "Metadata contains duplicated column names: ",
+      paste(
+        unique(
+          colnames(metadata)[duplicated(colnames(metadata))]
+        ),
+        collapse = ", "
+      )
+    )
+  }
+  
+  # Confirm that samples are correctly aligned
+  stopifnot(
+    ncol(expression_matrix) == nrow(metadata),
+    identical(
+      colnames(expression_matrix),
+      metadata$sample_id
+    )
+  )
+  
+  pca <- prcomp(
+    t(expression_matrix),
+    center = TRUE,
+    scale. = FALSE
+  )
+  
+  variance <- pca$sdev^2
+  variance_percent <- variance / sum(variance) * 100
+  
+  # Start with metadata rather than adding it to another
+  # data frame that already contains sample_id
+  pca_data <- metadata
+  
+  pca_data$PC1 <- pca$x[, 1]
+  pca_data$PC2 <- pca$x[, 2]
+  
+  list(
+    pca = pca,
+    data = pca_data,
+    variance_percent = variance_percent
+  )
+}
+
+
+# Define the plot function 
+
+plot_pca <- function(
+    pca_result,
+    colour_by,
+    shape_by,
+    title = NULL
+) {
+  stopifnot(
+    is.list(pca_result),
+    all(c("data", "variance_percent") %in% names(pca_result)),
+    colour_by %in% colnames(pca_result$data),
+    shape_by %in% colnames(pca_result$data)
+  )
+  
+  ggplot(
+    pca_result$data,
+    aes(
+      x = PC1,
+      y = PC2,
+      colour = .data[[colour_by]],
+      shape = .data[[shape_by]]
+    )
+  ) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(
+      title = title,
+      x = sprintf(
+        "PC1 (%.1f%%)",
+        pca_result$variance_percent[1]
+      ),
+      y = sprintf(
+        "PC2 (%.1f%%)",
+        pca_result$variance_percent[2]
+      ),
+      colour = colour_by,
+      shape = shape_by
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(face = "bold")
+    )
+}
+############################################################
+# 3. INITIAL PCA: ALL SIX GEO DATASETS AND GTEx
+############################################################
+
+pca_initial_before <- run_pca(
+  expr_raw,
+  meta_aligned
+)
+
+pca_initial_after <- run_pca(
+  expr_norm,
+  meta_aligned
+)
+
+# Before normalization: coloured by dataset
+p1 <- plot_pca(
+  pca_initial_before,
+  colour_by = "batch_1",
+  shape_by = "condition",
+  title = "A. Before normalization: dataset"
+)
+
+# Before normalization: coloured by platform
+p2 <- plot_pca(
+  pca_initial_before,
+  colour_by = "platform",
+  shape_by = "condition",
+  title = "C. Before normalization: platform"
+)
+
+# Before normalization: coloured by histotype
+p3 <- plot_pca(
+  pca_initial_before,
+  colour_by = "Type",
+  shape_by = "condition",
+  title = "E. Before normalization: histotype"
+)
+
+# After normalization: coloured by dataset
+p4 <- plot_pca(
+  pca_initial_after,
+  colour_by = "batch_1",
+  shape_by = "condition",
+  title = "B. After normalization: dataset"
+)
+
+# After normalization: coloured by platform
+p5 <- plot_pca(
+  pca_initial_after,
+  colour_by = "platform",
+  shape_by = "condition",
+  title = "D. After normalization: platform"
+)
+
+# After normalization: coloured by histotype
+p6 <- plot_pca(
+  pca_initial_after,
+  colour_by = "Type",
+  shape_by = "condition",
+  title = "F. After normalization: histotype"
+)
+
+initial_pca_figure <-
+  (p1 + p2 + p3) /
+  (p4 + p5 + p6) +
+  plot_annotation(
+    title = paste(
+      "Initial PCA quality assessment:",
+      "six GEO datasets and GTEx"
+    )
+  )
+
+ggsave(
+  file.path(
+    output_dir,
+    "Figure_S1_initial_PCA_all_datasets.png"
+  ),
+  initial_pca_figure,
+  width = 16,
+  height = 10,
+  dpi = 300
+)
+
+
+############################################################
+# 4. RLE FUNCTIONS
+############################################################
+
+calculate_rle <- function(expression_matrix) {
+  
+  expression_matrix <- as.matrix(expression_matrix)
+  
+  # Replace non-finite values
+  expression_matrix[
+    !is.finite(expression_matrix)
+  ] <- NA_real_
+  
+  gene_medians <- apply(
+    expression_matrix,
+    1,
+    median,
+    na.rm = TRUE
+  )
+  
+  keep_genes <- is.finite(gene_medians)
+  
+  expression_matrix <- expression_matrix[
+    keep_genes,
+    ,
+    drop = FALSE
+  ]
+  
+  gene_medians <- gene_medians[keep_genes]
+  
+  sweep(
+    expression_matrix,
+    1,
+    gene_medians,
+    FUN = "-"
+  )
+}
+
+
+############################################################
+# 5. INITIAL RLE: BEFORE AND AFTER NORMALIZATION
+############################################################
+
+rle_initial_before <- calculate_rle(expr_raw)
+rle_initial_after  <- calculate_rle(expr_norm)
+
+common_rle_limits <- range(
+  c(rle_initial_before, rle_initial_after),
+  finite = TRUE
+)
+
+common_rle_limits
+
+common_rle_limits
+is.finite(common_rle_limits)
+diff(common_rle_limits)
+
+# Colour samples by source
+source_colours <- ifelse(
+  meta_aligned$source == "GEO",
+  "#E69F00",
+  "#56B4E9"
+)
+
+# Establish a common y-axis
+all_rle_values <- c(
+  rle_initial_before,
+  rle_initial_after
+)
+
+all_rle_values <- all_rle_values[
+  is.finite(all_rle_values)
+]
+
+common_rle_limits <- quantile(
+  all_rle_values,
+  probabilities = c(0.01, 0.99),
+  na.rm = TRUE,
+  names = FALSE
+)
+
+png(
+  file.path(
+    output_dir,
+    "Figure_S2_initial_RLE_all_datasets.png"
+  ),
+  width = 3200,
+  height = 1900,
+  res = 250
+)
+
+par(
+  mfrow = c(2, 1),
+  mar = c(3, 5, 3, 2)
+)
+
+all_rle_values <- c(
+  rle_initial_before[is.finite(rle_initial_before)],
+  rle_initial_after[is.finite(rle_initial_after)]
+)
+
+common_rle_limits <- as.numeric(
+  quantile(
+    all_rle_values,
+    probs = c(0.01, 0.99),
+    na.rm = TRUE,
+    names = FALSE
+  )
+)
+
+common_rle_limits
+length(common_rle_limits)
+
+boxplot(
+  rle_initial_before,
+  outline = FALSE,
+  names = FALSE,
+  col = source_colours,
+  border = source_colours,
+  ylim = common_rle_limits,
+  ylab = "Relative log expression",
+  main = "A. RLE before normalization"
+)
+
+abline(h = 0, lty = 2, col = "red")
+
+legend(
+  "topright",
+  legend = c("GEO cancer", "GTEx normal"),
+  fill = c("#E69F00", "#56B4E9"),
+  bty = "n"
+)
+
+boxplot(
+  rle_initial_after,
+  outline = FALSE,
+  names = FALSE,
+  col = source_colours,
+  border = source_colours,
+  ylim = common_rle_limits,
+  ylab = "Relative log expression",
+  xlab = "Samples",
+  main = "B. RLE after normalization"
+)
+
+abline(h = 0, lty = 2, col = "red")
+
+legend(
+  "topright",
+  legend = c("GEO cancer", "GTEx normal"),
+  fill = c("#E69F00", "#56B4E9"),
+  bty = "n"
+)
+
+dev.off()
+
+
+############################################################
+# 6. DENSITY FUNCTIONS
+############################################################
+
+make_density_data <- function(
+    expression_matrix,
+    sample_ids,
+    metadata
+) {
+  
+  # Ensure sample identifiers are character
+  sample_ids <- as.character(sample_ids)
+  
+  # Select samples and force the result to be a matrix
+  density_matrix <- as.matrix(
+    expression_matrix[
+      ,
+      sample_ids,
+      drop = FALSE
+    ]
+  )
+  
+  # Melt using the matrix method
+  density_data <- reshape2::melt(
+    density_matrix,
+    varnames = c("Gene", "Sample"),
+    value.name = "LogExpression"
+  )
+  
+  density_data$Gene <- as.character(
+    density_data$Gene
+  )
+  
+  density_data$Sample <- as.character(
+    density_data$Sample
+  )
+  
+  # Match sample information
+  sample_match <- match(
+    density_data$Sample,
+    metadata$sample_id
+  )
+  
+  density_data$Batch <- metadata$batch_1[
+    sample_match
+  ]
+  
+  density_data$Source <- metadata$source[
+    sample_match
+  ]
+  
+  density_data$Condition <- metadata$condition[
+    sample_match
+  ]
+  
+  # Stop if any samples failed to match
+  if (anyNA(density_data$Batch)) {
+    
+    unmatched_samples <- unique(
+      density_data$Sample[
+        is.na(density_data$Batch)
+      ]
+    )
+    
+    stop(
+      "The following samples did not match the metadata: ",
+      paste(unmatched_samples, collapse = ", ")
+    )
+  }
+  
+  density_data
+}
+
+select_density_samples <- function(
+    metadata,
+    number_per_batch = 4,
+    seed = 123
+) {
+  metadata <- as.data.frame(metadata)
+  
+  # Check required columns
+  required_columns <- c("sample_id", "batch_1")
+  
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(metadata)
+  )
+  
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing metadata columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+  
+  # Check sample identifiers
+  if (anyNA(metadata$sample_id)) {
+    stop("metadata$sample_id contains missing values.")
+  }
+  
+  if (anyDuplicated(metadata$sample_id)) {
+    stop("metadata$sample_id contains duplicated values.")
+  }
+  
+  # Remove samples without batch information
+  valid_metadata <- metadata[
+    !is.na(metadata$batch_1),
+    ,
+    drop = FALSE
+  ]
+  
+  set.seed(seed)
+  
+  # Split sample IDs according to batch
+  samples_by_batch <- split(
+    valid_metadata$sample_id,
+    valid_metadata$batch_1
+  )
+  
+  # Select up to the requested number from every batch
+  selected_samples <- unlist(
+    lapply(
+      samples_by_batch,
+      function(ids) {
+        sample(
+          ids,
+          size = min(number_per_batch, length(ids)),
+          replace = FALSE
+        )
+      }
+    ),
+    use.names = FALSE
+  )
+  
+  as.character(selected_samples)
+}
+############################################################
+# 7. INITIAL DENSITY PLOTS
+############################################################
+
+initial_density_samples <- select_density_samples(
+  meta_aligned,
+  number_per_batch = 4
+)
+
+density_initial_before <- make_density_data(
+  expr_raw,
+  initial_density_samples,
+  meta_aligned
+)
+
+density_initial_after <- make_density_data(
+  expr_norm,
+  initial_density_samples,
+  meta_aligned
+)
+
+density_plot_before <- ggplot(
+  density_initial_before,
+  aes(
+    x = LogExpression,
+    group = Sample,
+    colour = Batch
+  )
+) +
+  geom_density(linewidth = 0.6, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "A. Expression distributions before normalization",
+    x = "Log2 expression",
+    y = "Density"
+  )
+
+density_plot_after <- ggplot(
+  density_initial_after,
+  aes(
+    x = LogExpression,
+    group = Sample,
+    colour = Batch
+  )
+) +
+  geom_density(linewidth = 0.6, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "B. Expression distributions after normalization",
+    x = "Normalized log2 expression",
+    y = "Density"
+  )
+
+initial_density_figure <-
+  density_plot_before +
+  density_plot_after +
+  plot_layout(ncol = 2)
+
+ggsave(
+  file.path(
+    output_dir,
+    "Figure_S3_initial_density_all_datasets.png"
+  ),
+  initial_density_figure,
+  width = 14,
+  height = 6,
+  dpi = 300
+)
+
+
+############################################################
+## LODO on the original six datasets 
+############################################################
+
+
+# ORIGINAL SIX-DATASET COHORT
+
+
+expr_lodo_full <- expr_norm
+meta_lodo_full <- meta_aligned
+
+stopifnot(
+  ncol(expr_lodo_full) == nrow(meta_lodo_full),
+  identical(
+    colnames(expr_lodo_full),
+    meta_lodo_full$sample_id
+  )
+)
+
+# Confirm that all six GEO datasets are present
+geo_datasets <- unique(
+  as.character(
+    meta_lodo_full$batch_1[
+      meta_lodo_full$source == "GEO"
+    ]
+  )
+)
+
+geo_datasets
+length(geo_datasets)
+
+stopifnot(length(geo_datasets) == 6)
+
+table(meta_lodo_full$batch_1)
+table(meta_lodo_full$condition)
+
+
+# Design the Lodo loop
+# Limma design 
+
+run_limma_same_design <- function(
+    expression_matrix,
+    metadata
+) {
+  expression_matrix <- as.matrix(expression_matrix)
+  metadata <- as.data.frame(metadata)
+  
+  stopifnot(
+    ncol(expression_matrix) == nrow(metadata),
+    identical(
+      colnames(expression_matrix),
+      metadata$sample_id
+    )
+  )
+  
+  # Match the terminology used in your primary analysis
+  metadata$condition <- factor(
+    metadata$condition,
+    levels = c("Cancer", "Normal"),
+    labels = c("EAOCs", "Normal")
+  )
+  
+  metadata$batch_1 <- droplevels(
+    factor(metadata$batch_1)
+  )
+  
+  stopifnot(
+    !anyNA(metadata$condition),
+    all(c("EAOCs", "Normal") %in% metadata$condition)
+  )
+  
+  design <- model.matrix(
+    ~ 0 + condition,
+    data = metadata
+  )
+  
+  colnames(design) <- c("EAOCs", "Normal")
+  
+  dup_corr <- duplicateCorrelation(
+    expression_matrix,
+    design,
+    block = metadata$batch_1
+  )
+  
+  fit <- lmFit(
+    expression_matrix,
+    design,
+    block = metadata$batch_1,
+    correlation = dup_corr$consensus
+  )
+  
+  contrast_matrix <- makeContrasts(
+    EAOCsVsNormal = EAOCs - Normal,
+    levels = design
+  )
+  
+  fit2 <- contrasts.fit(
+    fit,
+    contrast_matrix
+  )
+  
+  fit2 <- eBayes(fit2)
+  
+  results <- topTable(
+    fit2,
+    coef = "EAOCsVsNormal",
+    adjust.method = "BH",
+    number = Inf,
+    sort.by = "none"
+  )
+  
+  results$gene_id <- rownames(results)
+  
+  results
+}
+
+
+
+table(meta_aligned$condition)
+
+
+
+############################################################
+# LODO ANALYSIS: SIX ORIGINAL GEO DATASETS
+############################################################
+
+# Use the complete normalized cohort
+expr_full6 <- as.matrix(expr_norm)
+meta_full6 <- as.data.frame(meta_aligned)
+
+stopifnot(
+  ncol(expr_full6) == nrow(meta_full6),
+  identical(
+    colnames(expr_full6),
+    meta_full6$sample_id
+  )
+)
+
+# Identify the six GEO datasets
+geo_datasets <- unique(
+  as.character(
+    meta_full6$batch_1[
+      meta_full6$source == "GEO"
+    ]
+  )
+)
+
+print(geo_datasets)
+stopifnot(length(geo_datasets) == 6)
+
+
+############################################################
+# FULL SIX-DATASET REFERENCE ANALYSIS
+############################################################
+
+full6_result <- run_limma_same_design(
+  expression_matrix = expr_full6,
+  metadata = meta_full6
+)
+
+full6_significant <- full6_result$gene_id[
+  !is.na(full6_result$adj.P.Val) &
+    full6_result$adj.P.Val < 0.05 &
+    abs(full6_result$logFC) > 1
+]
+
+cat(
+  "Significant DEGs in the full six-dataset analysis:",
+  length(full6_significant),
+  "\n"
+)
+
+
+############################################################
+# LEAVE-ONE-DATASET-OUT LOOP
+############################################################
+
+LODO_results <- list()
+
+LODO_summary <- data.frame(
+  excluded_dataset = character(),
+  excluded_samples = integer(),
+  remaining_cancer = integer(),
+  remaining_normal = integer(),
+  significant_DEGs = integer(),
+  overlap_with_full6 = integer(),
+  overlap_percentage = numeric(),
+  logFC_spearman_correlation = numeric(),
+  direction_concordance = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (excluded_dataset in geo_datasets) {
+  
+  message("Running LODO: excluding ", excluded_dataset)
+  
+  # Remove every sample belonging to one GEO dataset
+  keep_samples <- !(
+    meta_full6$source == "GEO" &
+      meta_full6$batch_1 == excluded_dataset
+  )
+  
+  expr_lodo <- expr_full6[
+    ,
+    keep_samples,
+    drop = FALSE
+  ]
+  
+  meta_lodo <- meta_full6[
+    keep_samples,
+    ,
+    drop = FALSE
+  ]
+  
+  # Confirm sample alignment and presence of both conditions
+  stopifnot(
+    ncol(expr_lodo) == nrow(meta_lodo),
+    identical(
+      colnames(expr_lodo),
+      meta_lodo$sample_id
+    ),
+    all(
+      c("Cancer", "Normal") %in%
+        unique(meta_lodo$condition)
+    )
+  )
+  
+  # Run limma using the same design as the primary analysis
+  result_lodo <- run_limma_same_design(
+    expression_matrix = expr_lodo,
+    metadata = meta_lodo
+  )
+  
+  # Apply the same significance thresholds
+  significant_lodo <- result_lodo$gene_id[
+    !is.na(result_lodo$adj.P.Val) &
+      result_lodo$adj.P.Val < 0.05 &
+      abs(result_lodo$logFC) > 1
+  ]
+  
+  # Match genes between full and LODO analyses
+  common_genes <- intersect(
+    full6_result$gene_id,
+    result_lodo$gene_id
+  )
+  
+  full_match <- full6_result[
+    match(common_genes, full6_result$gene_id),
+    ,
+    drop = FALSE
+  ]
+  
+  lodo_match <- result_lodo[
+    match(common_genes, result_lodo$gene_id),
+    ,
+    drop = FALSE
+  ]
+  
+  # Compare log-fold changes
+  logFC_correlation <- cor(
+    full_match$logFC,
+    lodo_match$logFC,
+    method = "spearman",
+    use = "complete.obs"
+  )
+  
+  # Check whether fold-change directions agree
+  usable_genes <- (
+    is.finite(full_match$logFC) &
+      is.finite(lodo_match$logFC) &
+      full_match$logFC != 0 &
+      lodo_match$logFC != 0
+  )
+  
+  direction_concordance <- mean(
+    sign(full_match$logFC[usable_genes]) ==
+      sign(lodo_match$logFC[usable_genes])
+  )
+  
+  # Significant-gene overlap
+  overlap_genes <- intersect(
+    full6_significant,
+    significant_lodo
+  )
+  
+  overlap_percentage <- if (
+    length(full6_significant) > 0
+  ) {
+    100 * length(overlap_genes) /
+      length(full6_significant)
+  } else {
+    NA_real_
+  }
+  
+  # Save summary statistics
+  LODO_summary <- dplyr::bind_rows(
+    LODO_summary,
+    data.frame(
+      excluded_dataset = excluded_dataset,
+      excluded_samples = sum(!keep_samples),
+      remaining_cancer = sum(
+        meta_lodo$condition == "Cancer"
+      ),
+      remaining_normal = sum(
+        meta_lodo$condition == "Normal"
+      ),
+      significant_DEGs = length(significant_lodo),
+      overlap_with_full6 = length(overlap_genes),
+      overlap_percentage = overlap_percentage,
+      logFC_spearman_correlation = logFC_correlation,
+      direction_concordance = direction_concordance
+    )
+  )
+  
+  # Save complete results for this exclusion
+  LODO_results[[excluded_dataset]] <- result_lodo
+}
+
+
+############################################################
+# VIEW SUMMARY
+############################################################
+
+LODO_summary <- LODO_summary[
+  order(LODO_summary$excluded_dataset),
+]
+
+print(LODO_summary)
+
+############################################################
+# EXPORT LODO SUMMARY TO WORD
+############################################################
+
+# Install packages once if necessary
+required_packages <- c(
+  "officer",
+  "flextable",
+  "openxlsx"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(officer)
+library(flextable)
+library(openxlsx)
+
+
+############################################################
+# PREPARE A WORD-FRIENDLY SUMMARY TABLE
+############################################################
+
+LODO_summary_word <- LODO_summary
+
+# Round numerical results for presentation
+LODO_summary_word$overlap_percentage <- round(
+  LODO_summary_word$overlap_percentage,
+  1
+)
+
+LODO_summary_word$logFC_spearman_correlation <- round(
+  LODO_summary_word$logFC_spearman_correlation,
+  3
+)
+
+LODO_summary_word$direction_concordance <- round(
+  100 * LODO_summary_word$direction_concordance,
+  1
+)
+
+# Rename columns for publication
+colnames(LODO_summary_word) <- c(
+  "Excluded dataset",
+  "Excluded samples",
+  "Remaining cancer",
+  "Remaining normal",
+  "Significant DEGs",
+  "Overlap with full cohort",
+  "Overlap (%)",
+  "Spearman correlation",
+  "Direction concordance (%)"
+)
+
+# Create formatted table
+lodo_flextable <- flextable(
+  LODO_summary_word
+)
+
+lodo_flextable <- lodo_flextable |>
+  theme_booktabs() |>
+  bold(part = "header") |>
+  bg(
+    part = "header",
+    bg = "#D9EAF7"
+  ) |>
+  color(
+    part = "header",
+    color = "#000000"
+  ) |>
+  align(
+    align = "center",
+    part = "all"
+  ) |>
+  valign(
+    valign = "center",
+    part = "all"
+  ) |>
+  fontsize(
+    size = 9,
+    part = "all"
+  ) |>
+  padding(
+    padding = 4,
+    part = "all"
+  ) |>
+  autofit() |>
+  set_caption(
+    caption = paste(
+      "Table S1. Leave-one-dataset-out sensitivity",
+      "analysis across the six original GEO datasets."
+    )
+  )
+
+# Use landscape orientation because the table is wide
+word_document <- read_docx()
+
+word_document <- body_set_default_section(
+  word_document,
+  value = prop_section(
+    page_size = page_size(
+      orient = "landscape"
+    ),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+
+word_document <- body_add_flextable(
+  word_document,
+  value = lodo_flextable
+)
+
+word_document <- body_add_par(
+  word_document,
+  value = paste(
+    "Abbreviations: DEG, differentially expressed gene;",
+    "LODO, leave-one-dataset-out.",
+    "Overlap was calculated relative to the significant genes",
+    "identified in the complete six-dataset analysis."
+  ),
+  style = "Normal"
+)
+
+print(
+  word_document,
+  target = file.path(
+    output_dir,
+    "Table_S1_LODO_summary.docx"
+  )
+)
+
+
+############################################################
+# EXPORT COMPLETE LODO RESULTS TO EXCEL
+############################################################
+
+LODO_workbook <- createWorkbook()
+
+############################################################
+# SUMMARY WORKSHEET
+############################################################
+
+addWorksheet(
+  LODO_workbook,
+  sheetName = "LODO_summary"
+)
+
+writeData(
+  LODO_workbook,
+  sheet = "LODO_summary",
+  x = LODO_summary,
+  withFilter = TRUE
+)
+
+freezePane(
+  LODO_workbook,
+  sheet = "LODO_summary",
+  firstRow = TRUE
+)
+
+setColWidths(
+  LODO_workbook,
+  sheet = "LODO_summary",
+  cols = 1:ncol(LODO_summary),
+  widths = "auto"
+)
+
+
+############################################################
+# FULL SIX-DATASET REFERENCE RESULT
+############################################################
+
+addWorksheet(
+  LODO_workbook,
+  sheetName = "Full_six_dataset"
+)
+
+writeData(
+  LODO_workbook,
+  sheet = "Full_six_dataset",
+  x = full6_result,
+  withFilter = TRUE
+)
+
+freezePane(
+  LODO_workbook,
+  sheet = "Full_six_dataset",
+  firstRow = TRUE
+)
+
+setColWidths(
+  LODO_workbook,
+  sheet = "Full_six_dataset",
+  cols = 1:ncol(full6_result),
+  widths = "auto"
+)
+
+
+############################################################
+# ADD ONE WORKSHEET FOR EACH LODO ITERATION
+############################################################
+
+for (dataset_name in names(LODO_results)) {
+  
+  iteration_result <- LODO_results[[dataset_name]]
+  
+  # Add significance indicator
+  iteration_result$significant <- (
+    !is.na(iteration_result$adj.P.Val) &
+      iteration_result$adj.P.Val < 0.05 &
+      abs(iteration_result$logFC) > 1
+  )
+  
+  # Excel sheet names cannot exceed 31 characters
+  sheet_name <- substr(
+    paste0("Excluded_", dataset_name),
+    1,
+    31
+  )
+  
+  addWorksheet(
+    LODO_workbook,
+    sheetName = sheet_name
+  )
+  
+  writeData(
+    LODO_workbook,
+    sheet = sheet_name,
+    x = iteration_result,
+    withFilter = TRUE
+  )
+  
+  freezePane(
+    LODO_workbook,
+    sheet = sheet_name,
+    firstRow = TRUE
+  )
+  
+  setColWidths(
+    LODO_workbook,
+    sheet = sheet_name,
+    cols = 1:ncol(iteration_result),
+    widths = "auto"
+  )
+}
+
+
+############################################################
+# FORMAT ALL EXCEL WORKSHEETS
+############################################################
+
+header_style <- createStyle(
+  fontColour = "#FFFFFF",
+  fgFill = "#4C78A8",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  border = "Bottom",
+  borderColour = "#FFFFFF"
+)
+
+for (sheet_name in names(LODO_workbook)) {
+  
+  sheet_data <- if (
+    sheet_name == "LODO_summary"
+  ) {
+    LODO_summary
+  } else if (
+    sheet_name == "Full_six_dataset"
+  ) {
+    full6_result
+  } else {
+    dataset_name <- sub(
+      "^Excluded_",
+      "",
+      sheet_name
+    )
+    
+    LODO_results[[dataset_name]]
+  }
+  
+  addStyle(
+    LODO_workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = 1:ncol(sheet_data),
+    gridExpand = TRUE
+  )
+}
+
+
+############################################################
+# SAVE EXCEL WORKBOOK
+############################################################
+
+saveWorkbook(
+  LODO_workbook,
+  file = file.path(
+    output_dir,
+    "LODO_complete_iteration_results.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+
+
+###################################################################################################################
+###################################################################################################################
+
+############################################################
+# 8. EXCLUDE GSE160692 
+############################################################
+
+keep_final <- meta_aligned$batch_1 != "GSE160692"
+
+# This is a subset of the previously normalized matrix
+expr_final <- expr_norm[
+  ,
+  keep_final,
+  drop = FALSE
+]
+
+meta_final <- meta_aligned[
+  keep_final,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(expr_final),
+    meta_final$sample_id
+  )
+)
+
+table(meta_final$Type)
+table(meta_final$batch_1)
+table(meta_final$condition)
+
+
+############################################################
+# 9. FINAL-SUBSET PCA
+############################################################
+
+pca_final <- run_pca(
+  expr_final,
+  meta_final
+)
+
+final_pca_dataset <- plot_pca(
+  pca_final,
+  colour_by = "batch_1",
+  shape_by = "condition",
+  title = "A. Dataset and condition"
+)
+
+final_pca_platform <- plot_pca(
+  pca_final,
+  colour_by = "platform",
+  shape_by = "condition",
+  title = "B. Platform and condition"
+)
+
+final_pca_histotype <- plot_pca(
+  pca_final,
+  colour_by = "Type",
+  shape_by = "condition",
+  title = "C. Histotype"
+)
+
+final_pca_figure <-
+  final_pca_dataset +
+  final_pca_platform +
+  final_pca_histotype +
+  plot_layout(ncol = 3) +
+  plot_annotation(
+    title = paste(
+      "Study PCA",
+      "after excluding GSE160692"
+    )
+  )
+
+ggsave(
+  file.path(
+    output_dir,
+    "Figure_S4_final_subset_PCA_without_GSE160692.png"
+  ),
+  final_pca_figure,
+  width = 16,
+  height = 6,
+  dpi = 300
+)
+
+
+############################################################
+# 10. FINAL-SUBSET RLE
+############################################################
+
+rle_final <- calculate_rle(expr_final)
+
+final_source_colours <- ifelse(
+  meta_final$source == "GEO",
+  "#E69F00",
+  "#56B4E9"
+)
+
+png(
+  file.path(
+    output_dir,
+    "Figure_S5_final_subset_RLE_without_GSE160692.png"
+  ),
+  width = 3200,
+  height = 1000,
+  res = 250
+)
+
+par(mar = c(3, 5, 3, 2))
+
+boxplot(
+  rle_final,
+  outline = FALSE,
+  names = FALSE,
+  col = final_source_colours,
+  border = final_source_colours,
+  ylab = "Relative log expression",
+  xlab = "Samples",
+  main = paste(
+    "RLE of previously normalized data",
+    "after excluding GSE160692"
+  )
+)
+
+abline(h = 0, lty = 2, col = "red")
+
+legend(
+  "topright",
+  legend = c("GEO cancer", "GTEx normal"),
+  fill = c("#E69F00", "#56B4E9"),
+  bty = "n"
+)
+
+dev.off()
+
+
+############################################################
+# 11. FINAL-SUBSET DENSITY PLOT
+############################################################
+
+# Remove the unused GSE160692 factor level
+meta_final$batch_1 <- droplevels(
+  factor(meta_final$batch_1)
+)
+
+meta_final$sample_id <- as.character(
+  meta_final$sample_id
+)
+
+# Confirm that expression data and metadata remain aligned
+stopifnot(
+  ncol(expr_final) == nrow(meta_final),
+  identical(
+    colnames(expr_final),
+    meta_final$sample_id
+  ),
+  !"GSE160692" %in% levels(meta_final$batch_1)
+)
+
+# Select up to four samples from each retained dataset/batch
+final_density_samples <- select_density_samples(
+  metadata = meta_final,
+  number_per_batch = 4,
+  seed = 123
+)
+
+# Confirm that every selected sample exists
+stopifnot(
+  length(final_density_samples) > 0,
+  all(
+    final_density_samples %in%
+      colnames(expr_final)
+  )
+)
+
+# Prepare the long-format density data
+density_final <- make_density_data(
+  expression_matrix = expr_final,
+  sample_ids = final_density_samples,
+  metadata = meta_final
+)
+
+# Remove non-finite expression values before density estimation
+density_final <- density_final[
+  is.finite(density_final$LogExpression),
+  ,
+  drop = FALSE
+]
+
+stopifnot(nrow(density_final) > 0)
+
+# Generate the density plot
+final_density_plot <- ggplot(
+  density_final,
+  aes(
+    x = LogExpression,
+    group = Sample,
+    colour = Batch
+  )
+) +
+  geom_density(
+    linewidth = 0.7,
+    alpha = 0.8,
+    na.rm = TRUE
+  ) +
+  theme_bw() +
+  labs(
+    title = paste(
+      "Expression distributions after normalization",
+      "and exclusion of GSE160692"
+    ),
+    x = "Normalized log2 expression",
+    y = "Density",
+    colour = "Dataset"
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    )
+  )
+
+print(final_density_plot)
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    "Figure_S6_final_subset_density_without_GSE160692.png"
+  ),
+  plot = final_density_plot,
+  width = 9,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+
+#############################################################################
+##LODO after excluding the data set
+#############################################################################
+
+############################################################
+# 1. CHECK THE FINAL FIVE-DATASET COHORT
+############################################################
+
+expr_full5 <- as.matrix(expr_final)
+meta_full5 <- as.data.frame(meta_final)
+
+meta_full5$sample_id <- as.character(
+  meta_full5$sample_id
+)
+
+meta_full5$batch_1 <- droplevels(
+  factor(meta_full5$batch_1)
+)
+
+stopifnot(
+  ncol(expr_full5) == nrow(meta_full5),
+  identical(
+    colnames(expr_full5),
+    meta_full5$sample_id
+  ),
+  !"GSE160692" %in% as.character(meta_full5$batch_1)
+)
+
+geo_datasets5 <- unique(
+  as.character(
+    meta_full5$batch_1[
+      meta_full5$source == "GEO"
+    ]
+  )
+)
+
+geo_datasets5 <- sort(geo_datasets5)
+
+print(geo_datasets5)
+stopifnot(length(geo_datasets5) == 5)
+
+table(meta_full5$condition)
+table(meta_full5$batch_1)
+
+
+############################################################
+# 2. FULL FIVE-DATASET REFERENCE ANALYSIS
+############################################################
+
+full5_result <- run_limma_same_design(
+  expression_matrix = expr_full5,
+  metadata = meta_full5
+)
+
+full5_significant <- full5_result$gene_id[
+  !is.na(full5_result$adj.P.Val) &
+    full5_result$adj.P.Val < 0.05 &
+    abs(full5_result$logFC) > 1
+]
+
+cat(
+  "Significant DEGs in the complete five-dataset analysis:",
+  length(full5_significant),
+  "\n"
+)
+
+
+############################################################
+# 3. FIVE-DATASET LODO LOOP
+############################################################
+
+LODO5_results <- list()
+
+LODO5_summary <- data.frame(
+  excluded_dataset = character(),
+  excluded_samples = integer(),
+  remaining_cancer = integer(),
+  remaining_normal = integer(),
+  significant_DEGs = integer(),
+  overlap_with_full5 = integer(),
+  overlap_percentage = numeric(),
+  logFC_spearman_correlation = numeric(),
+  direction_concordance = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (excluded_dataset in geo_datasets5) {
+  
+  message(
+    "Running five-dataset LODO: excluding ",
+    excluded_dataset
+  )
+  
+  keep_lodo5 <- !(
+    meta_full5$source == "GEO" &
+      meta_full5$batch_1 == excluded_dataset
+  )
+  
+  expr_lodo5 <- expr_full5[
+    ,
+    keep_lodo5,
+    drop = FALSE
+  ]
+  
+  meta_lodo5 <- meta_full5[
+    keep_lodo5,
+    ,
+    drop = FALSE
+  ]
+  
+  meta_lodo5$batch_1 <- droplevels(
+    factor(meta_lodo5$batch_1)
+  )
+  
+  stopifnot(
+    ncol(expr_lodo5) == nrow(meta_lodo5),
+    identical(
+      colnames(expr_lodo5),
+      meta_lodo5$sample_id
+    ),
+    all(
+      c("Cancer", "Normal") %in%
+        unique(meta_lodo5$condition)
+    )
+  )
+  
+  # Refit the same limma model used in the primary analysis
+  result_lodo5 <- run_limma_same_design(
+    expression_matrix = expr_lodo5,
+    metadata = meta_lodo5
+  )
+  
+  # Apply the primary-analysis significance criteria
+  significant_lodo5 <- result_lodo5$gene_id[
+    !is.na(result_lodo5$adj.P.Val) &
+      result_lodo5$adj.P.Val < 0.05 &
+      abs(result_lodo5$logFC) > 1
+  ]
+  
+  # Match genes between the complete five-dataset analysis
+  # and the current LODO analysis
+  common_genes5 <- intersect(
+    full5_result$gene_id,
+    result_lodo5$gene_id
+  )
+  
+  full5_match <- full5_result[
+    match(
+      common_genes5,
+      full5_result$gene_id
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  lodo5_match <- result_lodo5[
+    match(
+      common_genes5,
+      result_lodo5$gene_id
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  # Spearman correlation of log2 fold changes
+  logFC_correlation5 <- cor(
+    full5_match$logFC,
+    lodo5_match$logFC,
+    method = "spearman",
+    use = "complete.obs"
+  )
+  
+  # Concordance in effect direction
+  usable_genes5 <- (
+    is.finite(full5_match$logFC) &
+      is.finite(lodo5_match$logFC) &
+      full5_match$logFC != 0 &
+      lodo5_match$logFC != 0
+  )
+  
+  direction_concordance5 <- mean(
+    sign(full5_match$logFC[usable_genes5]) ==
+      sign(lodo5_match$logFC[usable_genes5])
+  )
+  
+  # Overlap of significant genes
+  overlap_genes5 <- intersect(
+    full5_significant,
+    significant_lodo5
+  )
+  
+  overlap_percentage5 <- if (
+    length(full5_significant) > 0
+  ) {
+    100 * length(overlap_genes5) /
+      length(full5_significant)
+  } else {
+    NA_real_
+  }
+  
+  # Add results to the summary
+  LODO5_summary <- dplyr::bind_rows(
+    LODO5_summary,
+    data.frame(
+      excluded_dataset = excluded_dataset,
+      excluded_samples = sum(!keep_lodo5),
+      remaining_cancer = sum(
+        meta_lodo5$condition == "Cancer"
+      ),
+      remaining_normal = sum(
+        meta_lodo5$condition == "Normal"
+      ),
+      significant_DEGs = length(
+        significant_lodo5
+      ),
+      overlap_with_full5 = length(
+        overlap_genes5
+      ),
+      overlap_percentage = overlap_percentage5,
+      logFC_spearman_correlation =
+        logFC_correlation5,
+      direction_concordance =
+        direction_concordance5
+    )
+  )
+  
+  # Add significance indicator to complete iteration result
+  result_lodo5$significant <- (
+    !is.na(result_lodo5$adj.P.Val) &
+      result_lodo5$adj.P.Val < 0.05 &
+      abs(result_lodo5$logFC) > 1
+  )
+  
+  LODO5_results[[excluded_dataset]] <-
+    result_lodo5
+}
+
+
+############################################################
+# 4. VIEW FIVE-DATASET SUMMARY
+############################################################
+
+LODO5_summary <- LODO5_summary[
+  order(LODO5_summary$excluded_dataset),
+  ,
+  drop = FALSE
+]
+
+print(LODO5_summary)
+
+
+############################################################
+# 5. EXPORT FIVE-DATASET SUMMARY TO WORD
+############################################################
+
+LODO5_summary_word <- LODO5_summary
+
+LODO5_summary_word$overlap_percentage <- round(
+  LODO5_summary_word$overlap_percentage,
+  1
+)
+
+LODO5_summary_word$logFC_spearman_correlation <- round(
+  LODO5_summary_word$logFC_spearman_correlation,
+  3
+)
+
+LODO5_summary_word$direction_concordance <- round(
+  100 * LODO5_summary_word$direction_concordance,
+  1
+)
+
+colnames(LODO5_summary_word) <- c(
+  "Excluded dataset",
+  "Excluded samples",
+  "Remaining cancer",
+  "Remaining normal",
+  "Significant DEGs",
+  "Overlap with full five-dataset cohort",
+  "Overlap (%)",
+  "Spearman correlation",
+  "Direction concordance (%)"
+)
+
+lodo5_table <- flextable(
+  LODO5_summary_word
+)
+
+lodo5_table <- lodo5_table |>
+  theme_booktabs() |>
+  bold(part = "header") |>
+  bg(
+    part = "header",
+    bg = "#D9EAF7"
+  ) |>
+  align(
+    align = "center",
+    part = "all"
+  ) |>
+  valign(
+    valign = "center",
+    part = "all"
+  ) |>
+  fontsize(
+    size = 9,
+    part = "all"
+  ) |>
+  padding(
+    padding = 4,
+    part = "all"
+  ) |>
+  autofit() |>
+  set_caption(
+    caption = paste(
+      "Leave-one-dataset-out sensitivity analysis",
+      "across the five retained GEO datasets."
+    )
+  )
+
+LODO5_word_document <- read_docx()
+
+LODO5_word_document <- body_set_default_section(
+  LODO5_word_document,
+  value = prop_section(
+    page_size = page_size(
+      orient = "landscape"
+    ),
+    page_margins = page_mar(
+      top = 0.6,
+      bottom = 0.6,
+      left = 0.6,
+      right = 0.6
+    )
+  )
+)
+
+LODO5_word_document <- body_add_flextable(
+  LODO5_word_document,
+  value = lodo5_table
+)
+
+LODO5_word_document <- body_add_par(
+  LODO5_word_document,
+  value = paste(
+    "Abbreviations: DEG, differentially expressed gene;",
+    "LODO, leave-one-dataset-out.",
+    "Overlap was calculated relative to significant genes",
+    "identified in the complete five-dataset primary analysis."
+  ),
+  style = "Normal"
+)
+
+print(
+  LODO5_word_document,
+  target = file.path(
+    output_dir,
+    "Table_LODO5_summary.docx"
+  )
+)
+
+
+
+############################################################
+# 6. EXPORT COMPLETE FIVE-DATASET LODO RESULTS
+############################################################
+
+LODO5_workbook <- list(
+  LODO5_summary = LODO5_summary,
+  Full_five_dataset = full5_result
+)
+
+for (dataset_name in names(LODO5_results)) {
+  
+  sheet_name <- substr(
+    paste0("Excluded_", dataset_name),
+    1,
+    31
+  )
+  
+  LODO5_workbook[[sheet_name]] <-
+    LODO5_results[[dataset_name]]
+}
+
+openxlsx::write.xlsx(
+  LODO5_workbook,
+  file = file.path(
+    output_dir,
+    "LODO5_complete_iteration_results.xlsx"
+  ),
+  asTable = TRUE,
+  overwrite = TRUE
+)
+
+
+
+
