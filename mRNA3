@@ -1,0 +1,2788 @@
+############################################################
+## META-ANALYSIS OF FIVE GEO CANCER DATASETS
+## USING SHARED GTEx NORMAL CONTROLS
+##
+## Starts with filtered count data before ComBat-seq
+## and before quantile normalization.
+############################################################
+
+
+############################################################
+## 1. Load required packages
+############################################################
+
+library(edgeR)
+library(limma)
+library(metafor)
+library(dplyr)
+library(openxlsx)
+
+
+packageVersion("edgeR")
+packageVersion("limma")
+
+############################################################
+## 2. Prepare count matrix and metadata
+############################################################
+
+counts_meta <- as.matrix(counts_all)
+
+metadata_meta <- as.data.frame(meta)
+
+metadata_meta$sample_id <- as.character(
+  metadata_meta$sample_id
+)
+
+# Standardize sample identifiers so GTEx sample names
+# match between the count matrix and metadata.
+
+colnames(counts_meta) <- gsub(
+  "\\.",
+  "-",
+  colnames(counts_meta)
+)
+
+metadata_meta$sample_id <- gsub(
+  "\\.",
+  "-",
+  metadata_meta$sample_id
+)
+
+stopifnot(
+  !anyDuplicated(colnames(counts_meta)),
+  !anyDuplicated(metadata_meta$sample_id),
+  setequal(
+    colnames(counts_meta),
+    metadata_meta$sample_id
+  )
+)
+
+# Reorder metadata to match the count matrix.
+
+metadata_meta <- metadata_meta[
+  match(
+    colnames(counts_meta),
+    metadata_meta$sample_id
+  ),
+  ,
+  drop = FALSE
+]
+
+rownames(metadata_meta) <- metadata_meta$sample_id
+
+stopifnot(
+  identical(
+    colnames(counts_meta),
+    rownames(metadata_meta)
+  )
+)
+
+
+############################################################
+## 3. Exclude GSE160692
+############################################################
+
+keep_samples <- metadata_meta$batch_1 != "GSE160692"
+
+counts_meta <- counts_meta[
+  ,
+  keep_samples,
+  drop = FALSE
+]
+
+metadata_meta <- metadata_meta[
+  keep_samples,
+  ,
+  drop = FALSE
+]
+
+metadata_meta$batch_1 <- droplevels(
+  factor(metadata_meta$batch_1)
+)
+
+stopifnot(
+  identical(
+    colnames(counts_meta),
+    rownames(metadata_meta)
+  ),
+  !"GSE160692" %in% as.character(
+    metadata_meta$batch_1
+  )
+)
+
+############################################################
+## 4. Retain GEO cancer samples and GTEx normal controls
+############################################################
+
+keep_analysis_samples <- (
+  metadata_meta$source == "GEO" &
+    metadata_meta$condition == "Cancer"
+) | (
+  metadata_meta$source == "GTEx" &
+    metadata_meta$condition == "Normal"
+)
+
+counts_meta <- counts_meta[
+  ,
+  keep_analysis_samples,
+  drop = FALSE
+]
+
+metadata_meta <- metadata_meta[
+  keep_analysis_samples,
+  ,
+  drop = FALSE
+]
+
+metadata_meta$batch_1 <- droplevels(
+  factor(
+    metadata_meta$batch_1
+  )
+)
+
+stopifnot(
+  identical(
+    colnames(counts_meta),
+    rownames(metadata_meta)
+  )
+)
+
+
+
+############################################################
+## 5. Check the number of datasets and normal samples
+############################################################
+
+cancer_datasets <- sort(
+  unique(
+    as.character(
+      metadata_meta$batch_1[
+        metadata_meta$source == "GEO" &
+          metadata_meta$condition == "Cancer"
+      ]
+    )
+  )
+)
+
+normal_index <- which(
+  metadata_meta$source == "GTEx" &
+    metadata_meta$condition == "Normal"
+)
+
+stopifnot(
+  length(cancer_datasets) == 5,
+  length(normal_index) == 149
+)
+
+
+############################################################
+## 6. Confirm that the previously filtered count matrix
+## is suitable for analysis
+############################################################
+
+stopifnot(
+  nrow(counts_meta) > 0,
+  all(is.finite(counts_meta)),
+  all(counts_meta >= 0)
+)
+
+############################################################
+## 7. Apply TMM normalization
+############################################################
+
+dge_meta <- edgeR::DGEList(
+  counts = counts_meta
+)
+
+dge_meta <- edgeR::calcNormFactors(
+  dge_meta,
+  method = "TMM"
+)
+
+
+############################################################
+## 8. Define GEO datasets and GTEx sequencing centres
+############################################################
+
+metadata_meta$analysis_group <- ifelse(
+  metadata_meta$source == "GTEx",
+  paste0(
+    "GTEx_",
+    metadata_meta$batch_1
+  ),
+  paste0(
+    "GEO_",
+    metadata_meta$batch_1
+  )
+)
+
+metadata_meta$analysis_group <- factor(
+  metadata_meta$analysis_group
+)
+
+
+unique(metadata_meta$analysis_group)
+
+############################################################
+## 9. Create the design matrix
+############################################################
+
+design_meta <- model.matrix(
+  ~ 0 + analysis_group,
+  data = metadata_meta
+)
+
+colnames(design_meta) <- levels(
+  metadata_meta$analysis_group
+)
+
+stopifnot(
+  nrow(design_meta) == ncol(counts_meta),
+  qr(design_meta)$rank == ncol(design_meta)
+)
+
+
+############################################################
+## 10. Apply the voom transformation
+############################################################
+
+voom_meta <- limma::voom(
+  dge_meta,
+  design_meta,
+  plot = TRUE
+)
+
+
+############################################################
+## 11. Fit the limma model
+############################################################
+
+fit_meta <- limma::lmFit(
+  voom_meta,
+  design_meta
+)
+
+
+head(
+  fit_meta$coefficients
+)
+
+
+############################################################
+## 12. Identify GEO datasets and GTEx sequencing centres
+############################################################
+
+cancer_groups <- grep(
+  "^GEO_",
+  colnames(design_meta),
+  value = TRUE
+)
+
+normal_groups <- grep(
+  "^GTEx_",
+  colnames(design_meta),
+  value = TRUE
+)
+
+stopifnot(
+  length(cancer_groups) == 5,
+  length(normal_groups) == 2
+)
+
+
+############################################################
+## 13. Create cancer-versus-GTEx contrasts
+############################################################
+
+contrast_matrix <- matrix(
+  0,
+  nrow = ncol(design_meta),
+  ncol = length(cancer_groups),
+  dimnames = list(
+    colnames(design_meta),
+    cancer_groups
+  )
+)
+
+for (
+  dataset_name in cancer_groups
+) {
+  
+  contrast_matrix[
+    dataset_name,
+    dataset_name
+  ] <- 1
+  
+  contrast_matrix[
+    normal_groups,
+    dataset_name
+  ] <- -1 / length(
+    normal_groups
+  )
+  
+}
+
+print(
+  contrast_matrix
+)
+
+############################################################
+## 14. Fit contrasts and apply empirical Bayes moderation
+############################################################
+
+fit_meta_contrasts <- limma::contrasts.fit(
+  fit_meta,
+  contrast_matrix
+)
+
+fit_meta_contrasts <- limma::eBayes(
+  fit_meta_contrasts
+)
+
+
+############################################################
+## 15. Extract results for each GEO dataset
+############################################################
+
+dataset_results <- lapply(
+  cancer_groups,
+  function(dataset_name) {
+    
+    results_dataset <- limma::topTable(
+      fit_meta_contrasts,
+      coef = dataset_name,
+      number = Inf,
+      sort.by = "none",
+      confint = TRUE
+    )
+    
+    results_dataset$ensembl_gene_id <- rownames(
+      results_dataset
+    )
+    
+    results_dataset$dataset <- sub(
+      "^GEO_",
+      "",
+      dataset_name
+    )
+    
+    # Calculate the limma moderated standard error.
+    
+    moderated_standard_errors <-
+      fit_meta_contrasts$stdev.unscaled[
+        ,
+        dataset_name
+      ] *
+      sqrt(
+        fit_meta_contrasts$s2.post
+      )
+    
+    names(moderated_standard_errors) <- rownames(
+      fit_meta_contrasts$coefficients
+    )
+    
+    results_dataset$standard_error <-
+      moderated_standard_errors[
+        results_dataset$ensembl_gene_id
+      ]
+    
+    results_dataset %>%
+      dplyr::select(
+        ensembl_gene_id,
+        dataset,
+        logFC,
+        standard_error,
+        CI.L,
+        CI.R,
+        AveExpr,
+        t,
+        P.Value,
+        adj.P.Val,
+        B
+      )
+    
+  }
+)
+
+names(dataset_results) <- sub(
+  "^GEO_",
+  "",
+  cancer_groups
+)
+
+study_effect_sizes <- dplyr::bind_rows(
+  dataset_results
+)
+
+
+############################################################
+## 16. Calculate group-specific precision from voom weights
+############################################################
+
+group_weight_totals <- voom_meta$weights %*%
+  design_meta
+
+rownames(group_weight_totals) <- rownames(
+  voom_meta$E
+)
+
+colnames(group_weight_totals) <- colnames(
+  design_meta
+)
+
+stopifnot(
+  all(is.finite(group_weight_totals)),
+  all(group_weight_totals > 0)
+)
+
+
+############################################################
+## 17. Extract moderated gene-specific variance
+############################################################
+
+posterior_variance <- fit_meta_contrasts$s2.post
+
+names(posterior_variance) <- rownames(
+  fit_meta_contrasts$coefficients
+)
+
+stopifnot(
+  length(posterior_variance) ==
+    nrow(group_weight_totals),
+  all(is.finite(posterior_variance)),
+  all(posterior_variance > 0)
+)
+
+
+############################################################
+## 18. Calculate variance attributable to GTEx controls
+############################################################
+
+# Each GTEx centre contributes equally to the
+# cancer-versus-normal comparisons.
+
+normal_centre_weights <- abs(
+  contrast_matrix[
+    normal_groups,
+    cancer_groups[1]
+  ]
+)
+
+# Variance of the shared GTEx reference for each gene.
+
+shared_control_variance <- posterior_variance *
+  rowSums(
+    sweep(
+      1 / group_weight_totals[
+        ,
+        normal_groups,
+        drop = FALSE
+      ],
+      2,
+      normal_centre_weights^2,
+      "*"
+    )
+  )
+
+names(shared_control_variance) <- rownames(
+  group_weight_totals
+)
+
+
+############################################################
+## 19. Calculate dataset-specific cancer variance
+############################################################
+
+cancer_specific_variance <- sweep(
+  1 / group_weight_totals[
+    ,
+    cancer_groups,
+    drop = FALSE
+  ],
+  1,
+  posterior_variance,
+  "*"
+)
+
+rownames(cancer_specific_variance) <- rownames(
+  group_weight_totals
+)
+
+colnames(cancer_specific_variance) <- cancer_groups
+
+
+############################################################
+## 20. Check that calculated variances match limma
+############################################################
+
+reconstructed_total_variance <- sweep(
+  cancer_specific_variance,
+  1,
+  shared_control_variance,
+  "+"
+)
+
+limma_total_variance <- sweep(
+  fit_meta_contrasts$stdev.unscaled[
+    ,
+    cancer_groups,
+    drop = FALSE
+  ]^2,
+  1,
+  posterior_variance,
+  "*"
+)
+
+stopifnot(
+  isTRUE(
+    all.equal(
+      unname(
+        reconstructed_total_variance
+      ),
+      unname(
+        limma_total_variance
+      ),
+      tolerance = 1e-6,
+      check.attributes = FALSE
+    )
+  )
+)
+
+
+############################################################
+## 21. Apply the Han et al. decoupling transformation
+############################################################
+
+# For a covariance matrix consisting of dataset-specific
+# variances plus one shared-control component, the
+# following calculation is equivalent to:
+#
+# 1 / colSums(solve(covariance_matrix))
+
+dataset_precision_sum <- rowSums(
+  1 / cancer_specific_variance
+)
+
+decoupling_factor <- 1 +
+  shared_control_variance *
+  dataset_precision_sum
+
+decoupled_variance <- sweep(
+  cancer_specific_variance,
+  1,
+  decoupling_factor,
+  "*"
+)
+
+decoupled_standard_error <- sqrt(
+  decoupled_variance
+)
+
+rownames(decoupled_standard_error) <- rownames(
+  cancer_specific_variance
+)
+
+colnames(decoupled_standard_error) <- cancer_groups
+
+
+############################################################
+## 22. Verify the decoupling transformation for one gene
+############################################################
+
+example_gene <- 1
+
+example_covariance <- matrix(
+  shared_control_variance[example_gene],
+  nrow = length(cancer_groups),
+  ncol = length(cancer_groups)
+)
+
+diag(
+  example_covariance
+) <- cancer_specific_variance[
+  example_gene,
+] + shared_control_variance[example_gene]
+
+example_decoupled_variance <- 1 / colSums(
+  solve(
+    example_covariance
+  )
+)
+
+stopifnot(
+  isTRUE(
+    all.equal(
+      as.numeric(
+        decoupled_variance[
+          example_gene,
+        ]
+      ),
+      as.numeric(
+        example_decoupled_variance
+      ),
+      tolerance = 1e-6
+    )
+  )
+)
+
+
+############################################################
+## 23. Add decoupled standard errors to study-level results
+############################################################
+
+decoupled_dataset_results <- lapply(
+  cancer_groups,
+  function(dataset_name) {
+    
+    dataset_label <- sub(
+      "^GEO_",
+      "",
+      dataset_name
+    )
+    
+    results_dataset <- dataset_results[[dataset_label]]
+    
+    gene_positions <- match(
+      results_dataset$ensembl_gene_id,
+      rownames(
+        decoupled_standard_error
+      )
+    )
+    
+    results_dataset$shared_control_variance <-
+      shared_control_variance[
+        gene_positions
+      ]
+    
+    results_dataset$cancer_specific_variance <-
+      cancer_specific_variance[
+        gene_positions,
+        dataset_name
+      ]
+    
+    results_dataset$decoupled_variance <-
+      decoupled_variance[
+        gene_positions,
+        dataset_name
+      ]
+    
+    results_dataset$decoupled_standard_error <-
+      decoupled_standard_error[
+        gene_positions,
+        dataset_name
+      ]
+    
+    results_dataset
+    
+  }
+)
+
+names(decoupled_dataset_results) <- sub(
+  "^GEO_",
+  "",
+  cancer_groups
+)
+
+study_effect_sizes_decoupled <- dplyr::bind_rows(
+  decoupled_dataset_results
+)
+
+
+############################################################
+## 24. Perform random-effects meta-analysis for each gene
+############################################################
+
+effect_size_matrix <- fit_meta_contrasts$coefficients[
+  ,
+  cancer_groups,
+  drop = FALSE
+]
+
+meta_analysis_list <- lapply(
+  seq_len(
+    nrow(effect_size_matrix)
+  ),
+  function(gene_index) {
+    
+    if (
+      gene_index %% 1000 == 0
+    ) {
+      
+      message(
+        "Analysed ",
+        gene_index,
+        " of ",
+        nrow(effect_size_matrix),
+        " genes."
+      )
+      
+    }
+    
+    gene_id <- rownames(
+      effect_size_matrix
+    )[gene_index]
+    
+    gene_effect_sizes <- as.numeric(
+      effect_size_matrix[
+        gene_index,
+      ]
+    )
+    
+    gene_decoupled_variance <- as.numeric(
+      decoupled_variance[
+        gene_index,
+      ]
+    )
+    
+    valid_datasets <- is.finite(
+      gene_effect_sizes
+    ) &
+      is.finite(
+        gene_decoupled_variance
+      ) &
+      gene_decoupled_variance > 0
+    
+    if (
+      sum(valid_datasets) < 2
+    ) {
+      
+      return(
+        data.frame(
+          ensembl_gene_id = gene_id,
+          number_of_datasets = sum(
+            valid_datasets
+          ),
+          meta_logFC = NA_real_,
+          standard_error = NA_real_,
+          lower_CI = NA_real_,
+          upper_CI = NA_real_,
+          P.Value = NA_real_,
+          tau_squared = NA_real_,
+          stringsAsFactors = FALSE
+        )
+      )
+      
+    }
+    
+    gene_model <- tryCatch(
+      metafor::rma.uni(
+        yi = gene_effect_sizes[
+          valid_datasets
+        ],
+        vi = gene_decoupled_variance[
+          valid_datasets
+        ],
+        method = "REML"
+      ),
+      error = function(e) {
+        NULL
+      }
+    )
+    
+    if (
+      is.null(
+        gene_model
+      )
+    ) {
+      
+      return(
+        data.frame(
+          ensembl_gene_id = gene_id,
+          number_of_datasets = sum(
+            valid_datasets
+          ),
+          meta_logFC = NA_real_,
+          standard_error = NA_real_,
+          lower_CI = NA_real_,
+          upper_CI = NA_real_,
+          P.Value = NA_real_,
+          tau_squared = NA_real_,
+          stringsAsFactors = FALSE
+        )
+      )
+      
+    }
+    
+    data.frame(
+      ensembl_gene_id = gene_id,
+      number_of_datasets = sum(
+        valid_datasets
+      ),
+      meta_logFC = as.numeric(
+        stats::coef(
+          gene_model
+        )
+      ),
+      standard_error = as.numeric(
+        gene_model$se
+      ),
+      lower_CI = as.numeric(
+        gene_model$ci.lb
+      ),
+      upper_CI = as.numeric(
+        gene_model$ci.ub
+      ),
+      P.Value = as.numeric(
+        gene_model$pval
+      ),
+      tau_squared = as.numeric(
+        gene_model$tau2
+      ),
+      stringsAsFactors = FALSE
+    )
+    
+  }
+)
+
+
+meta_analysis_results <- dplyr::bind_rows(
+  meta_analysis_list
+)
+
+sum(
+  meta_analysis_results$tau_squared == 0,
+  na.rm = TRUE
+)
+
+sum(
+  is.na(
+    meta_analysis_results$meta_logFC
+  )
+)
+meta_analysis_results <- meta_analysis_results %>%
+  dplyr::filter(
+    !is.na(meta_logFC)
+  )
+############################################################
+## 25. Adjust P values for multiple testing
+############################################################
+
+meta_analysis_results <- meta_analysis_results %>%
+  dplyr::mutate(
+    adj.P.Val = stats::p.adjust(
+      P.Value,
+      method = "BH"
+    ),
+    direction = dplyr::case_when(
+      meta_logFC > 0 ~ "Upregulated",
+      meta_logFC < 0 ~ "Downregulated",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::arrange(
+    adj.P.Val
+  )
+
+
+############################################################
+## 26. Identify significant genes
+############################################################
+
+significant_meta_genes <- meta_analysis_results %>%
+  dplyr::filter(
+    !is.na(
+      adj.P.Val
+    ),
+    adj.P.Val < 0.05,
+    abs(
+      meta_logFC
+    ) > 1
+  )
+
+upregulated_meta_genes <- significant_meta_genes %>%
+  dplyr::filter(
+    meta_logFC > 1
+  )
+
+downregulated_meta_genes <- significant_meta_genes %>%
+  dplyr::filter(
+    meta_logFC < -1
+  )
+
+
+############################################################
+## 27. Create a summary table
+############################################################
+
+meta_analysis_summary <- data.frame(
+  analysis = c(
+    "GEO cancer datasets",
+    "GTEx normal samples",
+    "Genes analysed",
+    "Significant genes",
+    "Upregulated genes",
+    "Downregulated genes"
+  ),
+  number = c(
+    length(cancer_groups),
+    length(normal_index),
+    nrow(meta_analysis_results),
+    nrow(significant_meta_genes),
+    nrow(upregulated_meta_genes),
+    nrow(downregulated_meta_genes)
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+############################################################
+## 28. Export the results
+############################################################
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Supplementary_material/Supplementary_material"
+)
+
+openxlsx::write.xlsx(
+  x = list(
+    Analysis_summary = meta_analysis_summary,
+    Study_effect_sizes = study_effect_sizes,
+    Decoupled_study_effects = study_effect_sizes_decoupled,
+    All_meta_results = meta_analysis_results,
+    Significant_genes = significant_meta_genes,
+    Upregulated_genes = upregulated_meta_genes,
+    Downregulated_genes = downregulated_meta_genes
+  ),
+  file = file.path(
+    output_dir,
+    "GEO_GTEx_decoupled_meta_analysis.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+#####################################################################
+## As sensitivity  analysis
+####################################################################
+
+############################################################
+## SENSITIVITY ANALYSIS:
+## Primary pooled limma analysis versus
+## shared-control random-effects meta-analysis
+############################################################
+
+
+############################################################
+## 1. Confirm that the required objects exist
+############################################################
+
+stopifnot(
+  exists("results_EAOC"),
+  exists("meta_analysis_results"),
+  exists("study_effect_sizes_decoupled")
+)
+
+
+############################################################
+## 2. Prepare the primary pooled limma results
+############################################################
+
+primary_limma_results <- as.data.frame(
+  results_EAOC
+)
+
+# Only use row names when an Ensembl identifier column
+# is not already present.
+
+if (
+  !"ensembl_gene_id" %in%
+  names(primary_limma_results)
+) {
+  
+  primary_limma_results <-
+    tibble::rownames_to_column(
+      primary_limma_results,
+      var = "ensembl_gene_id"
+    )
+  
+}
+
+stopifnot(
+  all(
+    c(
+      "ensembl_gene_id",
+      "logFC",
+      "adj.P.Val"
+    ) %in%
+      names(primary_limma_results)
+  )
+)
+
+primary_limma_results <- primary_limma_results %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    ),
+    
+    primary_logFC = as.numeric(
+      logFC
+    ),
+    
+    primary_FDR = as.numeric(
+      adj.P.Val
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(primary_logFC)
+  ) %>%
+  dplyr::arrange(
+    primary_FDR
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    .keep_all = TRUE
+  ) %>%
+  dplyr::select(
+    ensembl_gene_id,
+    
+    dplyr::any_of(
+      c(
+        "external_gene_name",
+        "gene_symbol",
+        "SYMBOL"
+      )
+    ),
+    
+    primary_logFC,
+    primary_FDR
+  ) %>%
+  dplyr::mutate(
+    primary_significant =
+      !is.na(primary_FDR) &
+      primary_FDR < 0.05 &
+      abs(primary_logFC) > 1
+  )
+
+
+############################################################
+## 3. Prepare the meta-analysis results
+############################################################
+
+sensitivity_meta_results <- as.data.frame(
+  meta_analysis_results
+)
+
+stopifnot(
+  all(
+    c(
+      "ensembl_gene_id",
+      "meta_logFC"
+    ) %in%
+      names(sensitivity_meta_results)
+  )
+)
+
+# Calculate adjusted P values if they have not yet
+# been added to the meta-analysis results.
+
+if (
+  !"adj.P.Val" %in%
+  names(sensitivity_meta_results)
+) {
+  
+  stopifnot(
+    "P.Value" %in%
+      names(sensitivity_meta_results)
+  )
+  
+  sensitivity_meta_results$adj.P.Val <-
+    p.adjust(
+      sensitivity_meta_results$P.Value,
+      method = "BH"
+    )
+  
+}
+
+sensitivity_meta_results <-
+  sensitivity_meta_results %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    ),
+    
+    meta_logFC = as.numeric(
+      meta_logFC
+    ),
+    
+    meta_FDR = as.numeric(
+      adj.P.Val
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(meta_logFC)
+  ) %>%
+  dplyr::arrange(
+    meta_FDR
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    .keep_all = TRUE
+  ) %>%
+  dplyr::select(
+    ensembl_gene_id,
+    meta_logFC,
+    meta_FDR,
+    
+    dplyr::any_of(
+      c(
+        "number_of_datasets",
+        "standard_error",
+        "lower_CI",
+        "upper_CI",
+        "tau_squared"
+      )
+    )
+  ) %>%
+  dplyr::mutate(
+    meta_significant =
+      !is.na(meta_FDR) &
+      meta_FDR < 0.05 &
+      abs(meta_logFC) > 1
+  )
+
+
+############################################################
+## 4. Summarize direction across individual GEO datasets
+############################################################
+
+dataset_direction_summary <-
+  study_effect_sizes_decoupled %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    ),
+    
+    logFC = as.numeric(
+      logFC
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(logFC)
+  ) %>%
+  dplyr::group_by(
+    ensembl_gene_id
+  ) %>%
+  dplyr::summarise(
+    datasets_evaluated = dplyr::n_distinct(
+      dataset
+    ),
+    
+    datasets_upregulated = sum(
+      logFC > 0
+    ),
+    
+    datasets_downregulated = sum(
+      logFC < 0
+    ),
+    
+    consistent_direction_all_datasets =
+      datasets_upregulated == datasets_evaluated |
+      datasets_downregulated == datasets_evaluated,
+    
+    minimum_dataset_logFC = min(
+      logFC
+    ),
+    
+    maximum_dataset_logFC = max(
+      logFC
+    ),
+    
+    .groups = "drop"
+  )
+
+
+############################################################
+## 5. Compare all genes analyzed by both approaches
+############################################################
+
+all_gene_sensitivity_comparison <-
+  primary_limma_results %>%
+  dplyr::inner_join(
+    sensitivity_meta_results,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::left_join(
+    dataset_direction_summary,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::mutate(
+    same_direction =
+      sign(primary_logFC) ==
+      sign(meta_logFC)
+  )
+
+stopifnot(
+  nrow(
+    all_gene_sensitivity_comparison
+  ) > 0
+)
+
+all_gene_spearman <- cor(
+  all_gene_sensitivity_comparison$primary_logFC,
+  
+  all_gene_sensitivity_comparison$meta_logFC,
+  
+  method = "spearman",
+  
+  use = "complete.obs"
+)
+
+all_gene_directional_concordance <- 100 *
+  mean(
+    all_gene_sensitivity_comparison$same_direction,
+    na.rm = TRUE
+  )
+
+
+############################################################
+## 6. Extract significant genes from the primary analysis
+############################################################
+
+primary_significant_genes <-
+  primary_limma_results %>%
+  dplyr::filter(
+    primary_significant
+  )
+
+
+############################################################
+## 7. Determine whether primary DEGs are supported
+## by the sensitivity meta-analysis
+############################################################
+
+primary_DEG_sensitivity <-
+  primary_significant_genes %>%
+  dplyr::left_join(
+    sensitivity_meta_results,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::left_join(
+    dataset_direction_summary,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::mutate(
+    evaluated_in_meta = is.finite(
+      meta_logFC
+    ),
+    
+    same_direction = dplyr::case_when(
+      !evaluated_in_meta ~ NA,
+      
+      sign(primary_logFC) ==
+        sign(meta_logFC) ~ TRUE,
+      
+      TRUE ~ FALSE
+    ),
+    
+    significant_in_meta = dplyr::case_when(
+      !evaluated_in_meta ~ NA,
+      
+      is.na(meta_FDR) ~ NA,
+      
+      meta_FDR < 0.05 ~ TRUE,
+      
+      TRUE ~ FALSE
+    ),
+    
+    supported_FDR_and_direction =
+      dplyr::case_when(
+        !evaluated_in_meta ~ NA,
+        
+        is.na(meta_FDR) ~ NA,
+        
+        meta_FDR < 0.05 &
+          same_direction ~ TRUE,
+        
+        TRUE ~ FALSE
+      ),
+    
+    fully_supported = dplyr::case_when(
+      !evaluated_in_meta ~ NA,
+      
+      is.na(meta_FDR) ~ NA,
+      
+      meta_FDR < 0.05 &
+        abs(meta_logFC) > 1 &
+        same_direction ~ TRUE,
+      
+      TRUE ~ FALSE
+    ),
+    
+    datasets_matching_primary =
+      dplyr::case_when(
+        is.na(datasets_evaluated) ~ NA_integer_,
+        
+        primary_logFC > 0 ~ as.integer(
+          datasets_upregulated
+        ),
+        
+        primary_logFC < 0 ~ as.integer(
+          datasets_downregulated
+        ),
+        
+        TRUE ~ NA_integer_
+      ),
+    
+    sensitivity_category = dplyr::case_when(
+      !evaluated_in_meta ~
+        "Not evaluated in meta-analysis",
+      
+      fully_supported ~
+        "Supported by FDR, direction and effect size",
+      
+      supported_FDR_and_direction ~
+        "Supported by FDR and direction",
+      
+      !is.na(same_direction) &
+        same_direction ~
+        "Same direction but not significant",
+      
+      !is.na(same_direction) &
+        !same_direction ~
+        "Opposite direction",
+      
+      TRUE ~
+        "Insufficient information"
+    )
+  )
+
+
+############################################################
+## 8. Calculate concordance among primary DEGs
+############################################################
+
+evaluated_primary_DEGs <-
+  primary_DEG_sensitivity %>%
+  dplyr::filter(
+    evaluated_in_meta
+  )
+
+primary_DEG_spearman <- if (
+  nrow(
+    evaluated_primary_DEGs
+  ) > 1
+) {
+  
+  cor(
+    evaluated_primary_DEGs$primary_logFC,
+    
+    evaluated_primary_DEGs$meta_logFC,
+    
+    method = "spearman",
+    
+    use = "complete.obs"
+  )
+  
+} else {
+  
+  NA_real_
+  
+}
+
+primary_DEG_directional_concordance <- if (
+  nrow(
+    evaluated_primary_DEGs
+  ) > 0
+) {
+  
+  100 * mean(
+    evaluated_primary_DEGs$same_direction,
+    na.rm = TRUE
+  )
+  
+} else {
+  
+  NA_real_
+  
+}
+
+
+############################################################
+## 9. Create the sensitivity-analysis summary
+############################################################
+
+safe_percentage <- function(
+    numerator,
+    denominator
+) {
+  
+  if (
+    denominator == 0
+  ) {
+    
+    return(
+      NA_real_
+    )
+    
+  }
+  
+  100 * numerator / denominator
+  
+}
+
+number_primary_DEGs <- nrow(
+  primary_DEG_sensitivity
+)
+
+number_evaluated_DEGs <- sum(
+  primary_DEG_sensitivity$evaluated_in_meta
+)
+
+number_missing_DEGs <-
+  number_primary_DEGs -
+  number_evaluated_DEGs
+
+number_same_direction <- sum(
+  primary_DEG_sensitivity$same_direction,
+  na.rm = TRUE
+)
+
+number_FDR_supported <- sum(
+  primary_DEG_sensitivity$supported_FDR_and_direction,
+  na.rm = TRUE
+)
+
+number_fully_supported <- sum(
+  primary_DEG_sensitivity$fully_supported,
+  na.rm = TRUE
+)
+
+number_consistent_all_datasets <- sum(
+  primary_DEG_sensitivity$datasets_matching_primary ==
+    primary_DEG_sensitivity$datasets_evaluated,
+  na.rm = TRUE
+)
+
+sensitivity_analysis_summary <- data.frame(
+  analysis = c(
+    "Genes evaluated by both approaches",
+    
+    "Spearman correlation across all common genes",
+    
+    "Same direction across all common genes (%)",
+    
+    "Significant genes in primary analysis",
+    
+    "Primary DEGs evaluated in meta-analysis",
+    
+    "Primary DEGs unavailable in meta-analysis",
+    
+    "Spearman correlation among primary DEGs",
+    
+    "Primary DEGs showing the same direction",
+    
+    "Primary DEGs showing the same direction (%)",
+    
+    "Primary DEGs supported by FDR and direction",
+    
+    "Primary DEGs supported by FDR and direction (%)",
+    
+    "Primary DEGs supported by FDR, direction and |log2FC| > 1",
+    
+    "Primary DEGs supported by FDR, direction and |log2FC| > 1 (%)",
+    
+    "Primary DEGs matching direction across all datasets"
+  ),
+  
+  value = c(
+    nrow(
+      all_gene_sensitivity_comparison
+    ),
+    
+    all_gene_spearman,
+    
+    all_gene_directional_concordance,
+    
+    number_primary_DEGs,
+    
+    number_evaluated_DEGs,
+    
+    number_missing_DEGs,
+    
+    primary_DEG_spearman,
+    
+    number_same_direction,
+    
+    primary_DEG_directional_concordance,
+    
+    number_FDR_supported,
+    
+    safe_percentage(
+      number_FDR_supported,
+      number_evaluated_DEGs
+    ),
+    
+    number_fully_supported,
+    
+    safe_percentage(
+      number_fully_supported,
+      number_evaluated_DEGs
+    ),
+    
+    number_consistent_all_datasets
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+print(
+  sensitivity_analysis_summary
+)
+
+
+############################################################
+## 10. Summarize the sensitivity categories
+############################################################
+
+sensitivity_category_summary <-
+  primary_DEG_sensitivity %>%
+  dplyr::count(
+    sensitivity_category,
+    name = "number_of_genes"
+  ) %>%
+  dplyr::mutate(
+    percentage =
+      100 * number_of_genes /
+      number_primary_DEGs
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(
+      number_of_genes
+    )
+  )
+
+print(
+  sensitivity_category_summary
+)
+
+
+############################################################
+## 11. Create separate results tables
+############################################################
+
+sensitivity_supported_genes <-
+  primary_DEG_sensitivity %>%
+  dplyr::filter(
+    fully_supported
+  )
+
+sensitivity_unsupported_genes <-
+  primary_DEG_sensitivity %>%
+  dplyr::filter(
+    evaluated_in_meta,
+    !fully_supported
+  )
+
+sensitivity_missing_genes <-
+  primary_DEG_sensitivity %>%
+  dplyr::filter(
+    !evaluated_in_meta
+  )
+
+
+############################################################
+## 12. Summarize between-dataset variation
+############################################################
+
+if (
+  "tau_squared" %in%
+  names(primary_DEG_sensitivity)
+) {
+  
+  heterogeneity_summary <-
+    primary_DEG_sensitivity %>%
+    dplyr::filter(
+      evaluated_in_meta,
+      is.finite(tau_squared)
+    ) %>%
+    dplyr::summarise(
+      number_of_genes = dplyr::n(),
+      
+      median_tau_squared = median(
+        tau_squared
+      ),
+      
+      mean_tau_squared = mean(
+        tau_squared
+      ),
+      
+      genes_with_tau_squared_zero = sum(
+        tau_squared == 0
+      ),
+      
+      percentage_tau_squared_zero =
+        100 * mean(
+          tau_squared == 0
+        )
+    )
+  
+  print(
+    heterogeneity_summary
+  )
+  
+}
+
+
+############################################################
+## 13. Create the pooled-versus-meta concordance plot
+############################################################
+
+axis_limit <- ceiling(
+  max(
+    abs(
+      c(
+        all_gene_sensitivity_comparison$primary_logFC,
+        
+        all_gene_sensitivity_comparison$meta_logFC
+      )
+    ),
+    na.rm = TRUE
+  )
+)
+
+plot_annotation <- paste0(
+  "Genes = ",
+  
+  format(
+    nrow(
+      all_gene_sensitivity_comparison
+    ),
+    big.mark = ","
+  ),
+  
+  "\nSpearman \u03c1 = ",
+  
+  sprintf(
+    "%.3f",
+    all_gene_spearman
+  ),
+  
+  "\nSame direction = ",
+  
+  sprintf(
+    "%.1f",
+    all_gene_directional_concordance
+  ),
+  
+  "%"
+)
+
+sensitivity_concordance_plot <-
+  ggplot2::ggplot(
+    all_gene_sensitivity_comparison,
+    
+    ggplot2::aes(
+      x = primary_logFC,
+      y = meta_logFC
+    )
+  ) +
+  
+  ggplot2::geom_hline(
+    yintercept = 0,
+    colour = "grey70",
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_vline(
+    xintercept = 0,
+    colour = "grey70",
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    colour = "grey30",
+    linewidth = 0.6
+  ) +
+  
+  ggplot2::geom_point(
+    colour = "#0072B2",
+    alpha = 0.25,
+    size = 0.7
+  ) +
+  
+  ggplot2::annotate(
+    geom = "text",
+    
+    x = -0.95 * axis_limit,
+    
+    y = 0.95 * axis_limit,
+    
+    label = plot_annotation,
+    
+    hjust = 0,
+    
+    vjust = 1,
+    
+    size = 3.5
+  ) +
+  
+  ggplot2::coord_equal(
+    xlim = c(
+      -axis_limit,
+      axis_limit
+    ),
+    
+    ylim = c(
+      -axis_limit,
+      axis_limit
+    ),
+    
+    expand = FALSE
+  ) +
+  
+  ggplot2::labs(
+    title =
+      "Primary analysis versus sensitivity meta-analysis",
+    
+    x =
+      "Primary pooled analysis log2 fold change",
+    
+    y =
+      "Random-effects meta-analysis log2 fold change"
+  ) +
+  
+  ggplot2::theme_bw(
+    base_size = 11
+  ) +
+  
+  ggplot2::theme(
+    panel.grid.minor =
+      ggplot2::element_blank(),
+    
+    plot.title =
+      ggplot2::element_text(
+        face = "bold"
+      )
+  )
+
+print(
+  sensitivity_concordance_plot
+)
+
+
+############################################################
+## 14. Define the supplementary-material directory
+############################################################
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  
+  "Biochemistry submission/First revesion/",
+  
+  "Supplementary_material/Supplementary_material"
+)
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+
+############################################################
+## 15. Save the concordance plot
+############################################################
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "EAOC_meta_analysis_sensitivity_concordance.png"
+  ),
+  
+  plot = sensitivity_concordance_plot,
+  
+  width = 7,
+  
+  height = 7,
+  
+  units = "in",
+  
+  dpi = 600,
+  
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "EAOC_meta_analysis_sensitivity_concordance.pdf"
+  ),
+  
+  plot = sensitivity_concordance_plot,
+  
+  width = 7,
+  
+  height = 7,
+  
+  units = "in",
+  
+  device = grDevices::cairo_pdf,
+  
+  bg = "white"
+)
+
+
+############################################################
+## 16. Export the sensitivity-analysis workbook
+############################################################
+
+sensitivity_workbook <- list(
+  Sensitivity_summary =
+    sensitivity_analysis_summary,
+  
+  Sensitivity_categories =
+    sensitivity_category_summary,
+  
+  All_gene_comparison =
+    all_gene_sensitivity_comparison,
+  
+  Primary_DEG_comparison =
+    primary_DEG_sensitivity,
+  
+  Supported_primary_DEGs =
+    sensitivity_supported_genes,
+  
+  Unsupported_primary_DEGs =
+    sensitivity_unsupported_genes,
+  
+  Missing_primary_DEGs =
+    sensitivity_missing_genes,
+  
+  Dataset_direction_summary =
+    dataset_direction_summary
+)
+
+if (
+  exists("heterogeneity_summary")
+) {
+  
+  sensitivity_workbook$Heterogeneity_summary <-
+    heterogeneity_summary
+  
+}
+
+openxlsx::write.xlsx(
+  x = sensitivity_workbook,
+  
+  file = file.path(
+    output_dir,
+    "EAOC_meta_analysis_sensitivity_assessment.xlsx"
+  ),
+  
+  overwrite = TRUE
+)
+
+
+############################################################
+## THREE-PANEL META-ANALYSIS SENSITIVITY FIGURE
+##
+## A. Primary limma versus meta-analysis concordance
+## B. Between-dataset heterogeneity distribution
+## C. Heterogeneity categories
+############################################################
+
+
+############################################################
+## 1. Confirm that the required objects exist
+############################################################
+
+stopifnot(
+  exists("primary_DEG_sensitivity"),
+  exists("study_effect_sizes_decoupled")
+)
+
+stopifnot(
+  all(
+    c(
+      "ensembl_gene_id",
+      "primary_logFC",
+      "meta_logFC",
+      "fully_supported",
+      "tau_squared"
+    ) %in%
+      names(primary_DEG_sensitivity)
+  )
+)
+
+stopifnot(
+  all(
+    c(
+      "ensembl_gene_id",
+      "dataset"
+    ) %in%
+      names(study_effect_sizes_decoupled)
+  )
+)
+
+
+############################################################
+## 2. Identify the decoupled study variances
+############################################################
+
+heterogeneity_study_data <-
+  study_effect_sizes_decoupled
+
+if (
+  "decoupled_variance" %in%
+  names(heterogeneity_study_data)
+) {
+  
+  heterogeneity_study_data$study_variance <-
+    as.numeric(
+      heterogeneity_study_data$decoupled_variance
+    )
+  
+} else if (
+  "decoupled_standard_error" %in%
+  names(heterogeneity_study_data)
+) {
+  
+  heterogeneity_study_data$study_variance <-
+    as.numeric(
+      heterogeneity_study_data$decoupled_standard_error
+    )^2
+  
+} else {
+  
+  stop(
+    paste(
+      "The study-level results must contain either",
+      "'decoupled_variance' or",
+      "'decoupled_standard_error'."
+    )
+  )
+  
+}
+
+
+############################################################
+## 3. Calculate the typical within-study variance
+## required to estimate I-squared
+############################################################
+
+gene_sampling_variance <-
+  heterogeneity_study_data %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(study_variance),
+    study_variance > 0
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    dataset,
+    .keep_all = TRUE
+  ) %>%
+  dplyr::mutate(
+    inverse_variance_weight =
+      1 / study_variance
+  ) %>%
+  dplyr::group_by(
+    ensembl_gene_id
+  ) %>%
+  dplyr::summarise(
+    studies_for_I2 = dplyr::n(),
+    
+    sum_weights = sum(
+      inverse_variance_weight
+    ),
+    
+    sum_squared_weights = sum(
+      inverse_variance_weight^2
+    ),
+    
+    typical_sampling_variance =
+      dplyr::if_else(
+        studies_for_I2 > 1 &
+          sum_weights^2 > sum_squared_weights,
+        
+        (
+          (studies_for_I2 - 1) *
+            sum_weights
+        ) /
+          (
+            sum_weights^2 -
+              sum_squared_weights
+          ),
+        
+        NA_real_
+      ),
+    
+    .groups = "drop"
+  ) %>%
+  dplyr::select(
+    ensembl_gene_id,
+    studies_for_I2,
+    typical_sampling_variance
+  )
+
+
+############################################################
+## 4. Add I-squared and heterogeneity categories
+## to the primary DEG sensitivity results
+############################################################
+
+sensitivity_figure_data <-
+  primary_DEG_sensitivity %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    )
+  ) %>%
+  dplyr::left_join(
+    gene_sampling_variance,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::mutate(
+    I2_percent = dplyr::if_else(
+      is.finite(tau_squared) &
+        tau_squared >= 0 &
+        is.finite(typical_sampling_variance) &
+        typical_sampling_variance > 0,
+      
+      100 * tau_squared /
+        (
+          tau_squared +
+            typical_sampling_variance
+        ),
+      
+      NA_real_
+    ),
+    
+    heterogeneity_category =
+      dplyr::case_when(
+        !is.finite(I2_percent) ~
+          NA_character_,
+        
+        I2_percent < 25 ~
+          "Low",
+        
+        I2_percent < 50 ~
+          "Moderate",
+        
+        I2_percent < 75 ~
+          "Substantial",
+        
+        TRUE ~
+          "High"
+      ),
+    
+    heterogeneity_category = factor(
+      heterogeneity_category,
+      
+      levels = c(
+        "Low",
+        "Moderate",
+        "Substantial",
+        "High"
+      )
+    )
+  )
+
+
+############################################################
+## 5. Prepare data for Panel A
+############################################################
+
+panel_A_data <- sensitivity_figure_data %>%
+  dplyr::filter(
+    is.finite(primary_logFC),
+    is.finite(meta_logFC)
+  ) %>%
+  dplyr::mutate(
+    support_status = dplyr::case_when(
+      fully_supported ~
+        "Meta-analysis supported",
+      
+      TRUE ~
+        "Not fully supported"
+    ),
+    
+    support_status = factor(
+      support_status,
+      
+      levels = c(
+        "Meta-analysis supported",
+        "Not fully supported"
+      )
+    )
+  )
+
+stopifnot(
+  nrow(panel_A_data) > 0
+)
+
+panel_A_spearman <- cor(
+  panel_A_data$primary_logFC,
+  
+  panel_A_data$meta_logFC,
+  
+  method = "spearman",
+  
+  use = "complete.obs"
+)
+
+panel_A_directional_concordance <- 100 *
+  mean(
+    sign(panel_A_data$primary_logFC) ==
+      sign(panel_A_data$meta_logFC),
+    
+    na.rm = TRUE
+  )
+
+panel_A_axis_limit <- ceiling(
+  max(
+    abs(
+      c(
+        panel_A_data$primary_logFC,
+        panel_A_data$meta_logFC
+      )
+    ),
+    
+    na.rm = TRUE
+  )
+)
+
+
+############################################################
+## 6. Create Panel A:
+## Primary limma versus meta-analysis concordance
+############################################################
+
+plot_A <- ggplot2::ggplot(
+  panel_A_data,
+  
+  ggplot2::aes(
+    x = primary_logFC,
+    
+    y = meta_logFC,
+    
+    colour = support_status
+  )
+) +
+  
+  ggplot2::geom_hline(
+    yintercept = 0,
+    
+    colour = "grey70",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_vline(
+    xintercept = 0,
+    
+    colour = "grey70",
+    
+    linewidth = 0.4
+  ) +
+  
+  ggplot2::geom_abline(
+    intercept = 0,
+    
+    slope = 1,
+    
+    linetype = "dashed",
+    
+    colour = "grey30",
+    
+    linewidth = 0.6
+  ) +
+  
+  ggplot2::geom_point(
+    alpha = 0.45,
+    
+    size = 0.7
+  ) +
+  
+  ggplot2::scale_colour_manual(
+    values = c(
+      "Meta-analysis supported" = "#56B4E9",
+      
+      "Not fully supported" = "#D55E00"
+    )
+  ) +
+  
+  ggplot2::annotate(
+    geom = "text",
+    
+    x = -0.95 * panel_A_axis_limit,
+    
+    y = 0.95 * panel_A_axis_limit,
+    
+    label = paste0(
+      "Spearman \u03c1 = ",
+      
+      sprintf(
+        "%.3f",
+        panel_A_spearman
+      ),
+      
+      "\nSame direction = ",
+      
+      sprintf(
+        "%.1f",
+        panel_A_directional_concordance
+      ),
+      
+      "%"
+    ),
+    
+    hjust = 0,
+    
+    vjust = 1,
+    
+    size = 3
+  ) +
+  
+  ggplot2::coord_equal(
+    xlim = c(
+      -panel_A_axis_limit,
+      panel_A_axis_limit
+    ),
+    
+    ylim = c(
+      -panel_A_axis_limit,
+      panel_A_axis_limit
+    ),
+    
+    expand = FALSE
+  ) +
+  
+  ggplot2::labs(
+    title =
+      "Limma–meta-analysis concordance",
+    
+    x =
+      "Primary limma log2 fold change",
+    
+    y =
+      "Meta-analysis log2 fold change",
+    
+    colour =
+      NULL
+  ) +
+  
+  ggplot2::theme_bw(
+    base_size = 10
+  ) +
+  
+  ggplot2::theme(
+    panel.grid.minor =
+      ggplot2::element_blank(),
+    
+    plot.title =
+      ggplot2::element_text(
+        face = "bold",
+        
+        size = 10
+      ),
+    
+    legend.position =
+      "bottom",
+    
+    legend.text =
+      ggplot2::element_text(
+        size = 8
+      )
+  )
+
+
+############################################################
+## 7. Prepare supported genes for Panels B and C
+############################################################
+
+supported_heterogeneity_data <-
+  sensitivity_figure_data %>%
+  dplyr::filter(
+    fully_supported,
+    is.finite(I2_percent)
+  )
+
+stopifnot(
+  nrow(
+    supported_heterogeneity_data
+  ) > 0
+)
+
+median_I2 <- median(
+  supported_heterogeneity_data$I2_percent,
+  
+  na.rm = TRUE
+)
+
+Q1_I2 <- as.numeric(
+  stats::quantile(
+    supported_heterogeneity_data$I2_percent,
+    
+    probs = 0.25,
+    
+    na.rm = TRUE
+  )
+)
+
+Q3_I2 <- as.numeric(
+  stats::quantile(
+    supported_heterogeneity_data$I2_percent,
+    
+    probs = 0.75,
+    
+    na.rm = TRUE
+  )
+)
+
+
+############################################################
+## 8. Create Panel B:
+## Distribution of between-dataset heterogeneity
+############################################################
+
+plot_B <- ggplot2::ggplot(
+  supported_heterogeneity_data,
+  
+  ggplot2::aes(
+    x = I2_percent
+  )
+) +
+  
+  ggplot2::geom_histogram(
+    binwidth = 5,
+    
+    boundary = 0,
+    
+    fill = "#4C78A8",
+    
+    colour = "white",
+    
+    linewidth = 0.2
+  ) +
+  
+  ggplot2::geom_vline(
+    xintercept = median_I2,
+    
+    colour = "#D55E00",
+    
+    linetype = "dashed",
+    
+    linewidth = 0.8
+  ) +
+  
+  ggplot2::annotate(
+    geom = "text",
+    
+    x = median_I2,
+    
+    y = Inf,
+    
+    label = paste0(
+      "Median I\u00b2 = ",
+      
+      sprintf(
+        "%.1f",
+        median_I2
+      ),
+      
+      "%\nIQR = ",
+      
+      sprintf(
+        "%.1f",
+        Q1_I2
+      ),
+      
+      "\u2013",
+      
+      sprintf(
+        "%.1f",
+        Q3_I2
+      ),
+      
+      "%"
+    ),
+    
+    hjust = -0.05,
+    
+    vjust = 1.2,
+    
+    size = 3
+  ) +
+  
+  ggplot2::scale_x_continuous(
+    limits = c(
+      0,
+      100
+    ),
+    
+    breaks = seq(
+      0,
+      100,
+      by = 25
+    )
+  ) +
+  
+  ggplot2::labs(
+    title =
+      "Between-dataset heterogeneity",
+    
+    x =
+      expression(
+        I^2 ~ "(%)"
+      ),
+    
+    y =
+      "Number of supported primary DEGs"
+  ) +
+  
+  ggplot2::theme_bw(
+    base_size = 10
+  ) +
+  
+  ggplot2::theme(
+    panel.grid.minor =
+      ggplot2::element_blank(),
+    
+    plot.title =
+      ggplot2::element_text(
+        face = "bold",
+        
+        size = 10
+      )
+  )
+
+
+############################################################
+## 9. Summarize heterogeneity categories
+############################################################
+
+heterogeneity_category_summary <-
+  supported_heterogeneity_data %>%
+  dplyr::count(
+    heterogeneity_category,
+    
+    name = "number_of_genes",
+    
+    .drop = FALSE
+  ) %>%
+  dplyr::mutate(
+    percentage =
+      100 * number_of_genes /
+      sum(
+        number_of_genes
+      ),
+    
+    label = paste0(
+      format(
+        number_of_genes,
+        
+        big.mark = ","
+      ),
+      
+      "\n(",
+      
+      sprintf(
+        "%.1f",
+        percentage
+      ),
+      
+      "%)"
+    )
+  )
+
+
+############################################################
+## 10. Create Panel C:
+## Heterogeneity categories
+############################################################
+
+plot_C <- ggplot2::ggplot(
+  heterogeneity_category_summary,
+  
+  ggplot2::aes(
+    x = heterogeneity_category,
+    
+    y = percentage,
+    
+    fill = heterogeneity_category
+  )
+) +
+  
+  ggplot2::geom_col(
+    width = 0.75
+  ) +
+  
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = label
+    ),
+    
+    vjust = -0.4,
+    
+    size = 3
+  ) +
+  
+  ggplot2::scale_fill_manual(
+    values = c(
+      "Low" = "#56B4E9",
+      
+      "Moderate" = "#009E73",
+      
+      "Substantial" = "#E69F00",
+      
+      "High" = "#D55E00"
+    )
+  ) +
+  
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(
+      mult = c(
+        0,
+        0.18
+      )
+    )
+  ) +
+  
+  ggplot2::labs(
+    title =
+      "Heterogeneity categories",
+    
+    x =
+      expression(
+        I^2 ~ "category"
+      ),
+    
+    y =
+      "Supported primary DEGs (%)"
+  ) +
+  
+  ggplot2::theme_bw(
+    base_size = 10
+  ) +
+  
+  ggplot2::theme(
+    panel.grid.minor =
+      ggplot2::element_blank(),
+    
+    legend.position =
+      "none",
+    
+    plot.title =
+      ggplot2::element_text(
+        face = "bold",
+        
+        size = 10
+      ),
+    
+    axis.text.x =
+      ggplot2::element_text(
+        angle = 25,
+        
+        hjust = 1
+      )
+  )
+
+
+############################################################
+## 11. Combine the three panels
+############################################################
+
+meta_sensitivity_figure <-
+  patchwork::wrap_plots(
+    plot_A,
+    
+    plot_B,
+    
+    plot_C,
+    
+    nrow = 1,
+    
+    widths = c(
+      1.2,
+      1,
+      1
+    )
+  ) +
+  
+  patchwork::plot_annotation(
+    title =
+      paste(
+        "Study-level sensitivity meta-analysis",
+        "of EAOC differential gene expression"
+      ),
+    
+    tag_levels =
+      "A",
+    
+    theme =
+      ggplot2::theme(
+        plot.title =
+          ggplot2::element_text(
+            face = "bold",
+            
+            hjust = 0.5,
+            
+            size = 13
+          )
+      )
+  )
+
+print(
+  meta_sensitivity_figure
+)
+
+
+############################################################
+## 12. Define the output directory
+############################################################
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  
+  "Biochemistry submission/First revesion/",
+  
+  "Supplementary_material/Supplementary_material"
+)
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+
+############################################################
+## 13. Save the figure as PNG
+############################################################
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    
+    "EAOC_meta_analysis_sensitivity_figure.png"
+  ),
+  
+  plot =
+    meta_sensitivity_figure,
+  
+  width =
+    15,
+  
+  height =
+    5.5,
+  
+  units =
+    "in",
+  
+  dpi =
+    600,
+  
+  bg =
+    "white"
+)
+
+
+############################################################
+## 14. Save the figure as PDF
+############################################################
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    
+    "EAOC_meta_analysis_sensitivity_figure.pdf"
+  ),
+  
+  plot =
+    meta_sensitivity_figure,
+  
+  width =
+    15,
+  
+  height =
+    5.5,
+  
+  units =
+    "in",
+  
+  device =
+    grDevices::cairo_pdf,
+  
+  bg =
+    "white"
+)
+
+
+############################################################
+## 15. Export the figure data
+############################################################
+
+openxlsx::write.xlsx(
+  x = list(
+    Concordance_data =
+      panel_A_data,
+    
+    Supported_gene_heterogeneity =
+      supported_heterogeneity_data,
+    
+    Heterogeneity_categories =
+      heterogeneity_category_summary
+  ),
+  
+  file = file.path(
+    output_dir,
+    
+    "EAOC_meta_analysis_sensitivity_figure_data.xlsx"
+  ),
+  
+  overwrite =
+    TRUE
+)
+
+
+
+
+
+
+
+
+
+
+
