@@ -1,0 +1,6970 @@
+# Load packages 
+
+
+library(tximport)
+library(readr)
+library(dplyr)
+library(edgeR)
+library(limma)
+library(IRanges)
+library(GenomeInfoDb)
+library(biomaRt)
+library(readxl)
+library(sva)
+library(DESeq2)
+library(glmnet)
+library(randomForest)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(pheatmap)
+library(TDM) 
+library(rlang)
+library(tidyverse)
+library(preprocessCore)
+library(KEGGREST)
+library(openxlsx)
+library(stringr)
+library(curl)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(EnsDb.Hsapiens.v86)
+library(reshape2)
+library(purrr)
+library(tibble)
+library(multiMiR)
+library(patchwork)
+library(pathview)
+library(biomaRt)
+library(pheatmap)
+library(matrixStats)
+library(umap)
+library(rgl)
+library(png)
+
+
+
+# 7. Record package versions
+
+
+packageVersion("gprofiler2")
+packageVersion("ggplot2")
+packageVersion("dplyr")
+packageVersion("patchwork")
+packageVersion("umap")
+
+
+#GEO data sets mRNA 
+#####################################################################################################
+
+# RSEME_results folder can be found in the paper supplementary material 
+
+rsem_dir <- "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/First revesion/Supplementary_material/Supplementary_material/RSME_results"
+
+files <- list.files(
+  path = rsem_dir,
+  pattern = "_Aligned\\.toTranscriptome\\.out\\.bam\\.rsem\\.genes\\.results$",
+  full.names = TRUE
+)
+
+
+samples <- gsub(
+  "_Aligned\\.toTranscriptome\\.out\\.bam\\.rsem\\.genes\\.results$",
+  "",
+  basename(files)
+)
+
+names(files) <- samples
+
+# sanity checks
+stopifnot(!any(duplicated(samples)))
+print(samples)
+
+
+txi <- tximport(
+  files,
+  type = "rsem",
+  txIn = FALSE,
+  txOut = FALSE
+)
+
+
+count_mat <- txi$counts
+tpm_mat   <- txi$abundance
+
+
+
+# then we removed samples with <60% alignment in supplementary table6)
+
+cols_to_drop <- c(
+  "SRR8030212",
+  "SRR33292101",
+  "SRR33292069",
+  "SRR33292076",
+  "SRR33292026",
+  "SRR33292094",
+  "SRR33291991",
+  "SRR33292075"
+)
+
+count_mat <- count_mat[, !colnames(count_mat) %in% cols_to_drop]
+
+counts_cancer<-count_mat
+
+
+
+#################################################################################################
+#GTEX gene_count 
+###########################################
+
+# GTEx_Ovary_v10_RSEMv1.3.3_transcripts_expected_count.csv can be found in the supplementary material 
+
+GTEx <- read.csv("C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/EAOC/GTEx_Ovary_v10_RSEMv1.3.3_transcripts_expected_count.csv")
+
+head(GTEx)
+
+
+
+#Collapse transcriptome to genes 
+
+gene_counts <- GTEx %>%
+  group_by(gene_id) %>%
+  summarise(across(starts_with("GTEX."), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+
+#Here I had one sample extra so removed
+
+
+
+
+head(gene_counts)
+
+samples_gene_counts <- colnames(gene_counts)
+
+#############################################
+# Metadata prepration
+#############################################
+
+# metadata.xlsx is provided in the supplementary material of the study 
+
+
+SampleAttributes <- read.delim(
+  "https://storage.googleapis.com/adult-gtex/annotations/v10/metadata-files/GTEx_Analysis_v10_Annotations_SampleAttributesDS.txt",
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+
+metadata_1 <- read_xlsx(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/Biochemistry submission/Supplementary_material/Supplementary_material/Metadata.xlsx"
+)
+
+colnames(SampleAttributes)
+colnames(metadata_1)
+
+metadata_samples <- metadata_1$sample_id
+gtex_samples <- metadata_samples[grepl("GTEX\\.", metadata_samples)]
+identical(samples_gene_counts, gtex_samples)
+
+
+# Ensure both IDs are character
+SampleAttributes$SAMPID <- as.character(SampleAttributes$SAMPID)
+metadata_1$sample_id <- as.character(metadata_1$sample_id)
+
+metadata_1$sample_id <- gsub("\\.", "-", metadata_1$sample_id)
+
+# Left join to add SMCENTER as "batch"
+metadata_1 <- metadata_1%>%
+  left_join(
+    SampleAttributes %>% dplyr::select(SAMPID, SMCENTER),
+    by = c("sample_id" = "SAMPID")
+  ) %>%
+  dplyr::rename(batch_1 = SMCENTER)  
+
+# Check
+head(metadata_1)
+
+
+
+metadata_1 <- metadata_1 %>%
+  mutate(batch_1 = ifelse(is.na(batch_1), batch, batch_1)) %>%  
+  dplyr::select(-batch)  
+
+metadata_1 <- metadata_1[metadata_1$sample_id != "GTEX-QVJO-3126-SM-COH22", ]
+
+# Check
+head(metadata)
+
+rows_to_drop <- c(
+  "SRR8030212",
+  "SRR33292101",
+  "SRR33292069",
+  "SRR33292076",
+  "SRR33292026",
+  "SRR33292094",
+  "SRR33291991",
+  "SRR33292075"
+)
+
+meta <- metadata_1[!metadata_1$sample_id %in% rows_to_drop, ]
+
+gene_counts <- gene_counts[, colnames(gene_counts) != "GTEX.QVJO.3126.SM.COH22"]
+
+########################################################
+## Data Integration and Normalisation
+########################################################
+
+# Combine count matrices into one matrix 
+
+gene_counts<-as.data.frame(gene_counts)
+rownames(gene_counts)<-gene_counts$gene_id
+gene_counts$gene_id<- NULL
+
+counts_cancer<- as.data.frame(counts_cancer)
+
+# Remove _PAR genes from both datasets
+counts_cancer <- counts_cancer[!grepl("_PAR", rownames(counts_cancer)), ]
+gene_counts   <- gene_counts[!grepl("_PAR", rownames(gene_counts)), ]
+
+# Merge matrices using common genes
+common_genes <- intersect(rownames(counts_cancer), rownames(gene_counts))
+
+counts_all <- cbind(
+  counts_cancer[common_genes, ],
+  gene_counts[common_genes, ]
+)
+
+# Remove Ensembl version numbers
+gene_ids <- sub("\\..*", "", rownames(counts_all))
+
+# Collapse duplicated Ensembl IDs (sum counts)
+counts_all <- rowsum(counts_all, group = gene_ids)
+
+anyDuplicated(rownames(counts_all))
+
+
+# Filter low-abundance genes
+min_counts <- 5
+min_samples <- ceiling(0.1* ncol(counts_all))
+
+keep <- rowSums(counts_all >= min_counts) >= min_samples
+
+counts_all <- counts_all[keep, ]
+
+# Batch correction 
+
+meta$source <- ifelse(
+  grepl("^SRR|g", meta$sample_id),
+  "GEO",
+  "GTEx"
+)
+
+is_geo <- meta$source != "GTEx"
+
+is_getx <- meta$source == "GTEx"
+
+table(meta$batch_1[is_getx])
+table(meta$batch_1[is_geo])
+
+
+batch_counts_1 <- table(meta$batch_1[is_getx])
+batch_counts_2 <- table(meta$batch_1[is_geo])
+
+
+
+counts_geo <- as.matrix(counts_all[, is_geo])
+batch_geo  <- as.factor(meta$batch_1[is_geo])
+
+geo_corrected_counts <- ComBat_seq(counts_geo, batch = batch_geo, group = NULL)
+
+
+
+counts_getx <- as.matrix(counts_all[, is_getx])
+batch_getx  <- as.factor(meta$batch_1[is_getx])
+
+getx_corrected_counts <- ComBat_seq(counts_getx, batch = batch_getx, group = NULL)
+
+
+counts_combined <- cbind(geo_corrected_counts,getx_corrected_counts )
+
+expr_merged <- log2(counts_combined + 1)
+
+table (meta$Type)
+
+# Quantile Normalization 
+
+# Apply Quantile Normalization to the whole thing together
+expr_norm <- normalize.quantiles(as.matrix(expr_merged))
+rownames(expr_norm) <- rownames(expr_merged)
+colnames(expr_norm) <- colnames(expr_merged)
+
+colnames(meta)
+colnames(expr_norm)
+#########################################################
+# diagnostics visualization / senstivity analysis 
+#########################################################
+
+meta <- meta %>%
+  mutate(
+    platform = case_when(
+      
+      # GEO datasets
+      batch_1 == "GSE230956" ~ "Illumina NextSeq 500",
+      batch_1 == "GSE189553" ~ "Illumina HiSeq 2500",
+      batch_1 == "GSE226870" ~ "Illumina HiSeq 2500",
+      batch_1 == "GSE121103" ~ "Illumina NextSeq 500",
+      batch_1 == "GSE160692" ~ "Illumina HiSeq 2000",
+      batch_1 == "GSE295399" ~ "Illumina NovaSeq 6000",
+      
+      # All GTEx samples
+      source == "GTEx" ~ "Illumina HiSeq 2000/2500",
+      
+      # Keep NA if dataset/platform is unknown
+      TRUE ~ NA_character_
+    )
+  )
+
+
+
+raw_combined <- counts_all
+
+expr_raw <- log2(raw_combined + 1)
+
+
+########################################################################################
+## Use the diagnostic visualization and sensitivity analysis r script at this point 
+########################################################################################
+
+##########################################################################################
+## Differential Gene expression 
+##########################################################################################
+
+##------- Correctly align metadata with expr_norm before exclusion------##
+##------EAOC---------------##
+
+
+meta_aligned <- as.data.frame(meta)
+
+# Standardise only GTEx separators
+meta_aligned$sample_id_match <- gsub(
+  "-",
+  ".",
+  as.character(meta_aligned$sample_id)
+)
+
+# Confirm IDs are unique
+stopifnot(
+  !anyDuplicated(colnames(expr_norm)),
+  !anyDuplicated(meta_aligned$sample_id_match)
+)
+
+# Identify unmatched IDs
+setdiff(
+  colnames(expr_norm),
+  meta_aligned$sample_id_match
+)
+
+setdiff(
+  meta_aligned$sample_id_match,
+  colnames(expr_norm)
+)
+
+# Reorder the complete metadata to match expr_norm
+metadata_positions <- match(
+  colnames(expr_norm),
+  meta_aligned$sample_id_match
+)
+
+# Every expression column must have metadata
+stopifnot(!anyNA(metadata_positions))
+
+meta_aligned <- meta_aligned[
+  metadata_positions,
+  ,
+  drop = FALSE
+]
+
+rownames(meta_aligned) <- meta_aligned$sample_id_match
+
+# Confirm exact alignment
+stopifnot(
+  identical(
+    colnames(expr_norm),
+    rownames(meta_aligned)
+  )
+)
+
+
+
+
+# Exclude GSE160692 after alignment
+
+
+keep_samples <- meta_aligned$batch_1 != "GSE160692"
+
+expr_new2 <- expr_norm[
+  ,
+  keep_samples,
+  drop = FALSE
+]
+
+meta2 <- meta_aligned[
+  keep_samples,
+  ,
+  drop = FALSE
+]
+
+# Final check
+stopifnot(
+  identical(
+    colnames(expr_new2),
+    rownames(meta2)
+  )
+)
+
+
+# Examine exactly what was excluded
+
+
+excluded_samples <- data.frame(
+  sample_id = colnames(expr_norm)[!keep_samples],
+  dataset = meta_aligned$batch_1[!keep_samples]
+)
+
+excluded_samples
+table(excluded_samples$dataset)
+
+
+# Confirm retained samples
+
+colnames(expr_new2)[
+  grepl(
+    "^(g002|g506|g618|g741|SRR1297004[8-9]|SRR1297005[0-1])$",
+    colnames(expr_new2)
+  )
+]
+
+dim(expr_new2)
+table(meta2$batch_1)
+table(meta2$Type)
+
+expr_new2 <- as.matrix(expr_new2)
+
+# Confirm all entries are numeric
+stopifnot(
+  is.numeric(expr_new2),
+  all(is.finite(expr_new2))
+)
+
+design <- model.matrix(~ 0 + condition, data = meta2)
+colnames(design) <- c("EAOCs", "Normal")
+
+# 2. Estimate the correlation between samples within the same batch
+# This allows the model to 'understand' the GEO studies without crashing
+dup_corr <- duplicateCorrelation(expr_new2, design, block = meta2$batch_1)
+
+# 3. Run the fit with the 'block' and 'correlation' parameters
+fit <- lmFit(expr_new2, design, block = meta2$batch_1, correlation = dup_corr$consensus)
+
+contrast <- makeContrasts(EAOCs- Normal, levels=design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+results_EAOC <- topTable(fit2, adjust="BH", number=Inf)
+
+sig_genes_EAOC <- results_EAOC[results_EAOC$adj.P.Val < 0.05 & abs(results_EAOC$logFC) > 1, ]
+
+############################################################
+# EXPORT EAOC-VERSUS-NORMAL RESULTS TO EXCEL
+############################################################
+
+
+results_EAOC$ensembl_gene_id <- sub(
+  "\\..*$",
+  "",
+  rownames(results_EAOC)
+)
+
+
+
+# 3. Separate upregulated and downregulated genes
+
+
+upregulated_EAOC <- sig_genes_EAOC[
+  sig_genes_EAOC$logFC > 1,
+  ,
+  drop = FALSE
+]
+
+downregulated_EAOC <- sig_genes_EAOC[
+  sig_genes_EAOC$logFC < -1,
+  ,
+  drop = FALSE
+]
+
+
+# 4. Print result counts
+
+
+cat(
+  "All genes tested:",
+  nrow(results_EAOC),
+  "\n"
+)
+
+cat(
+  "Significant EAOC DEGs:",
+  nrow(sig_genes_EAOC),
+  "\n"
+)
+
+cat(
+  "Significantly upregulated:",
+  nrow(upregulated_EAOC),
+  "\n"
+)
+
+cat(
+  "Significantly downregulated:",
+  nrow(downregulated_EAOC),
+  "\n"
+)
+
+stopifnot(
+  nrow(sig_genes_EAOC) ==
+    nrow(upregulated_EAOC) +
+    nrow(downregulated_EAOC)
+)
+
+
+# 5. Create summary table
+
+
+eaoc_summary <- data.frame(
+  Category = c(
+    "All genes tested",
+    "Significant DEGs",
+    "Significantly upregulated",
+    "Significantly downregulated",
+    "Cancer samples included",
+    "Normal samples included",
+    "Samples excluded with GSE160692"
+  ),
+  Number = c(
+    nrow(results_EAOC),
+    nrow(sig_genes_EAOC),
+    nrow(upregulated_EAOC),
+    nrow(downregulated_EAOC),
+    sum(meta2$condition == "Cancer"),
+    sum(meta2$condition == "Normal"),
+    nrow(excluded_samples)
+  ),
+  Definition = c(
+    "All genes included in the EAOC-versus-normal limma analysis",
+    "Adjusted P-value < 0.05 and absolute log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change < -1",
+    "Retained OCCC and EnOC samples",
+    "Retained GTEx normal ovarian tissue samples",
+    "Samples belonging to GSE160692"
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(eaoc_summary)
+
+
+# 6. Move Ensembl identifiers to the first column
+
+move_ensembl_first <- function(result_data) {
+  
+  result_data <- as.data.frame(
+    result_data
+  )
+  
+  result_data[
+    ,
+    c(
+      "ensembl_gene_id",
+      setdiff(
+        colnames(result_data),
+        "ensembl_gene_id"
+      )
+    ),
+    drop = FALSE
+  ]
+}
+
+all_genes_export <- move_ensembl_first(
+  results_EAOC
+)
+
+significant_export <- move_ensembl_first(
+  sig_genes_EAOC
+)
+
+upregulated_export <- move_ensembl_first(
+  upregulated_EAOC
+)
+
+downregulated_export <- move_ensembl_first(
+  downregulated_EAOC
+)
+
+excluded_samples_export <- as.data.frame(
+  excluded_samples
+)
+
+
+# 7. Define the output directory
+
+
+output_dir_eaoc <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Supplementary_material/Supplementary_material"
+)
+
+dir.create(
+  output_dir_eaoc,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir_eaoc)
+)
+
+
+# 8. Create the workbook
+
+
+eaoc_workbook <- openxlsx::createWorkbook()
+
+workbook_data <- list(
+  Summary = eaoc_summary,
+  All_genes = all_genes_export,
+  Significant_DEGs = significant_export,
+  Upregulated = upregulated_export,
+  Downregulated = downregulated_export,
+  Excluded_GSE160692 = excluded_samples_export
+)
+
+for (sheet_name in names(workbook_data)) {
+  
+  openxlsx::addWorksheet(
+    eaoc_workbook,
+    sheetName = sheet_name
+  )
+  
+  openxlsx::writeData(
+    eaoc_workbook,
+    sheet = sheet_name,
+    x = workbook_data[[sheet_name]],
+    withFilter = TRUE
+  )
+}
+
+
+# 9. Create workbook styles
+
+
+header_style <- openxlsx::createStyle(
+  fontSize = 11,
+  fontColour = "#FFFFFF",
+  fgFill = "#4F81BD",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  border = "bottom",
+  borderColour = "#000000"
+)
+
+significant_style <- openxlsx::createStyle(
+  fgFill = "#E2F0D9"
+)
+
+upregulated_style <- openxlsx::createStyle(
+  fgFill = "#F4CCCC"
+)
+
+downregulated_style <- openxlsx::createStyle(
+  fgFill = "#CFE2F3"
+)
+
+
+# 10. Format all worksheets
+
+
+for (sheet_name in names(workbook_data)) {
+  
+  sheet_data <- workbook_data[[sheet_name]]
+  
+  openxlsx::addStyle(
+    eaoc_workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(ncol(sheet_data)),
+    gridExpand = TRUE
+  )
+  
+  openxlsx::freezePane(
+    eaoc_workbook,
+    sheet = sheet_name,
+    firstRow = TRUE
+  )
+  
+  openxlsx::setColWidths(
+    eaoc_workbook,
+    sheet = sheet_name,
+    cols = seq_len(ncol(sheet_data)),
+    widths = "auto"
+  )
+}
+
+
+# 12. Save the Excel workbook
+
+
+eaoc_excel_file <- file.path(
+  output_dir_eaoc,
+  "EAOC_vs_Normal_differential_expression_results.xlsx"
+)
+
+openxlsx::saveWorkbook(
+  eaoc_workbook,
+  file = eaoc_excel_file,
+  overwrite = TRUE
+)
+
+stopifnot(
+  file.exists(eaoc_excel_file)
+)
+
+cat(
+  "EAOC Excel workbook saved to:\n",
+  normalizePath(
+    eaoc_excel_file,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+
+browseURL(
+  normalizePath(
+    eaoc_excel_file,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+##########################################################################################################
+##-----------OCCC----------------------------------------------------------##
+
+
+colnames(meta2)
+unique(meta2$Type)
+
+
+
+# Retain normal samples and CC cancer samples
+keep_occc <- (
+  meta2$condition == "Normal" |
+    meta2$Type == "CC"
+)
+
+expr_occc <- expr_new2[
+  ,
+  keep_occc,
+  drop = FALSE
+]
+
+meta_occc <- meta2[
+  keep_occc,
+  ,
+  drop = FALSE
+]
+
+expr_occc <- as.matrix(expr_occc)
+
+# Confirm exact sample alignment
+stopifnot(
+  ncol(expr_occc) == nrow(meta_occc),
+  identical(
+    colnames(expr_occc),
+    rownames(meta_occc)
+  ),
+  all(is.finite(expr_occc))
+)
+
+# Confirm that cancer samples are all CC
+stopifnot(
+  all(
+    meta_occc$Type[
+      meta_occc$condition == "Cancer"
+    ] == "CC"
+  )
+)
+
+table(meta_occc$condition)
+table(meta_occc$Type)
+
+
+meta_occc$condition <- factor(
+  meta_occc$condition,
+  levels = c("Cancer", "Normal")
+)
+
+meta_occc$batch_1 <- droplevels(
+  factor(meta_occc$batch_1)
+)
+
+design_occc <- model.matrix(
+  ~ 0 + condition,
+  data = meta_occc
+)
+
+# Cancer now represents OCCC
+colnames(design_occc) <- c(
+  "OCCC",
+  "Normal"
+)
+
+stopifnot(
+  identical(
+    colnames(design_occc),
+    c("OCCC", "Normal")
+  ),
+  nrow(design_occc) == ncol(expr_occc)
+)
+
+dup_corr_occc <- limma::duplicateCorrelation(
+  expr_occc,
+  design_occc,
+  block = meta_occc$batch_1
+)
+
+fit_occc <- limma::lmFit(
+  expr_occc,
+  design_occc,
+  block = meta_occc$batch_1,
+  correlation =
+    dup_corr_occc$consensus
+)
+
+contrast_occc <- limma::makeContrasts(
+  OCCC_vs_Normal = OCCC - Normal,
+  levels = design_occc
+)
+
+fit2_occc <- limma::contrasts.fit(
+  fit_occc,
+  contrast_occc
+)
+
+fit2_occc <- limma::eBayes(
+  fit2_occc
+)
+
+
+
+results_occc <- limma::topTable(
+  fit2_occc,
+  coef = "OCCC_vs_Normal",
+  adjust.method = "BH",
+  number = Inf,
+  sort.by = "P"
+)
+
+results_occc$ensembl_gene_id <- sub(
+  "\\..*$",
+  "",
+  rownames(results_occc)
+)
+
+
+sig_genes_occc <- results_occc[
+  !is.na(results_occc$adj.P.Val) &
+    results_occc$adj.P.Val < 0.05 &
+    abs(results_occc$logFC) > 1,
+  ,
+  drop = FALSE
+]
+
+cat(
+  "Significant OCCC DEGs:",
+  nrow(sig_genes_occc),
+  "\n"
+)
+
+cat("Significant OCCC DEGs:",nrow(sig_genes_occc),"\n")
+cat("Upregulated:", sum(results_occc$logFC > 1), "\n")
+cat("Downregulated:", sum(results_occc$logFC < -1), "\n")
+
+############################################################
+# EXPORT OCCC-VERSUS-NORMAL RESULTS TO EXCEL
+############################################################
+
+results_occc$ensembl_gene_id <- sub(
+  "\\..*$",
+  "",
+  rownames(results_occc)
+)
+
+
+
+# 3. Separate significantly upregulated and downregulated genes
+
+upregulated_occc <- sig_genes_occc[
+  sig_genes_occc$logFC > 1,
+  ,
+  drop = FALSE
+]
+
+downregulated_occc <- sig_genes_occc[
+  sig_genes_occc$logFC < -1,
+  ,
+  drop = FALSE
+]
+
+
+# 4. Print correct result counts
+
+
+cat(
+  "All genes tested:",
+  nrow(results_occc),
+  "\n"
+)
+
+cat(
+  "Significant OCCC DEGs:",
+  nrow(sig_genes_occc),
+  "\n"
+)
+
+cat(
+  "Significantly upregulated:",
+  nrow(upregulated_occc),
+  "\n"
+)
+
+cat(
+  "Significantly downregulated:",
+  nrow(downregulated_occc),
+  "\n"
+)
+
+stopifnot(
+  nrow(sig_genes_occc) ==
+    nrow(upregulated_occc) +
+    nrow(downregulated_occc)
+)
+
+
+# 5. Create summary table
+
+
+occc_summary <- data.frame(
+  Category = c(
+    "All genes tested",
+    "Significant DEGs",
+    "Significantly upregulated",
+    "Significantly downregulated",
+    "OCCC samples included",
+    "Normal samples included"
+  ),
+  Number = c(
+    nrow(results_occc),
+    nrow(sig_genes_occc),
+    nrow(upregulated_occc),
+    nrow(downregulated_occc),
+    sum(
+      meta_occc$condition == "Cancer"
+    ),
+    sum(
+      meta_occc$condition == "Normal"
+    )
+  ),
+  Definition = c(
+    "All genes included in the OCCC-versus-normal limma analysis",
+    "Adjusted P-value < 0.05 and absolute log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change < -1",
+    "Ovarian clear cell carcinoma samples",
+    "GTEx normal ovarian tissue samples"
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(occc_summary)
+
+
+# 6. Prepare included-sample table
+
+
+included_occc_samples <- data.frame(
+  sample_id = rownames(meta_occc),
+  condition = as.character(
+    meta_occc$condition
+  ),
+  histotype = as.character(
+    meta_occc$Type
+  ),
+  dataset = as.character(
+    meta_occc$batch_1
+  ),
+  source = as.character(
+    meta_occc$source
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+# 7. Move Ensembl identifiers to the first column
+
+
+move_ensembl_first <- function(result_data) {
+  
+  result_data <- as.data.frame(
+    result_data
+  )
+  
+  result_data[
+    ,
+    c(
+      "ensembl_gene_id",
+      setdiff(
+        colnames(result_data),
+        "ensembl_gene_id"
+      )
+    ),
+    drop = FALSE
+  ]
+}
+
+all_genes_export <- move_ensembl_first(
+  results_occc
+)
+
+significant_export <- move_ensembl_first(
+  sig_genes_occc
+)
+
+upregulated_export <- move_ensembl_first(
+  upregulated_occc
+)
+
+downregulated_export <- move_ensembl_first(
+  downregulated_occc
+)
+
+
+# 8. Define the output directory
+
+
+output_dir_occc <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Supplementary_material/Supplementary_material"
+)
+
+dir.create(
+  output_dir_occc,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir_occc)
+)
+
+
+# 9. Assemble workbook contents
+
+
+workbook_data <- list(
+  Summary = occc_summary,
+  All_genes = all_genes_export,
+  Significant_DEGs = significant_export,
+  Upregulated = upregulated_export,
+  Downregulated = downregulated_export,
+  Included_samples = included_occc_samples
+)
+
+
+# 10. Create the workbook
+
+
+occc_workbook <- openxlsx::createWorkbook()
+
+for (sheet_name in names(workbook_data)) {
+  
+  openxlsx::addWorksheet(
+    occc_workbook,
+    sheetName = sheet_name
+  )
+  
+  openxlsx::writeData(
+    occc_workbook,
+    sheet = sheet_name,
+    x = workbook_data[[sheet_name]],
+    withFilter = TRUE
+  )
+}
+
+
+# 11. Create workbook styles
+
+
+header_style <- openxlsx::createStyle(
+  fontSize = 11,
+  fontColour = "#FFFFFF",
+  fgFill = "#4F81BD",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  border = "bottom",
+  borderColour = "#000000"
+)
+
+significant_style <- openxlsx::createStyle(
+  fgFill = "#E2F0D9"
+)
+
+upregulated_style <- openxlsx::createStyle(
+  fgFill = "#F4CCCC"
+)
+
+downregulated_style <- openxlsx::createStyle(
+  fgFill = "#CFE2F3"
+)
+
+
+# 12. Format all worksheets
+
+
+for (sheet_name in names(workbook_data)) {
+  
+  sheet_data <- workbook_data[[sheet_name]]
+  
+  openxlsx::addStyle(
+    occc_workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(
+      ncol(sheet_data)
+    ),
+    gridExpand = TRUE
+  )
+  
+  openxlsx::freezePane(
+    occc_workbook,
+    sheet = sheet_name,
+    firstRow = TRUE
+  )
+  
+  openxlsx::setColWidths(
+    occc_workbook,
+    sheet = sheet_name,
+    cols = seq_len(
+      ncol(sheet_data)
+    ),
+    widths = "auto"
+  )
+}
+
+
+
+# 14. Save the Excel workbook
+
+
+occc_excel_file <- file.path(
+  output_dir_occc,
+  "OCCC_vs_Normal_differential_expression_results.xlsx"
+)
+
+openxlsx::saveWorkbook(
+  occc_workbook,
+  file = occc_excel_file,
+  overwrite = TRUE
+)
+
+stopifnot(
+  file.exists(occc_excel_file)
+)
+
+cat(
+  "OCCC Excel workbook saved to:\n",
+  normalizePath(
+    occc_excel_file,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+
+
+##------------------EnOC----------------------------------------------------------------##
+
+colnames(meta2)
+unique(meta2$Type)
+
+# Retain normal samples and EE cancer samples
+keep_enoc <- (
+  meta2$condition == "Normal" |
+    meta2$Type == "EE"
+)
+
+expr_enoc <- expr_new2[
+  ,
+  keep_enoc,
+  drop = FALSE
+]
+
+meta_enoc <- meta2[
+  keep_enoc,
+  ,
+  drop = FALSE
+]
+
+expr_enoc <- as.matrix(expr_enoc)
+
+# Confirm exact sample alignment
+stopifnot(
+  ncol(expr_enoc) == nrow(meta_enoc),
+  identical(
+    colnames(expr_enoc),
+    rownames(meta_enoc)
+  ),
+  all(is.finite(expr_enoc))
+)
+
+# Confirm that all cancer samples in this subset are EE
+stopifnot(
+  all(
+    meta_enoc$Type[
+      meta_enoc$condition == "Cancer"
+    ] == "EE"
+  )
+)
+
+table(meta_enoc$condition)
+table(meta_enoc$Type)
+
+# Set condition levels explicitly
+meta_enoc$condition <- factor(
+  meta_enoc$condition,
+  levels = c("Cancer", "Normal")
+)
+
+# Remove unused dataset levels
+meta_enoc$batch_1 <- droplevels(
+  factor(meta_enoc$batch_1)
+)
+
+# Construct the design matrix
+design_enoc <- model.matrix(
+  ~ 0 + condition,
+  data = meta_enoc
+)
+
+# Cancer now represents EnOC
+colnames(design_enoc) <- c(
+  "EnOC",
+  "Normal"
+)
+
+stopifnot(
+  identical(
+    colnames(design_enoc),
+    c("EnOC", "Normal")
+  ),
+  nrow(design_enoc) == ncol(expr_enoc)
+)
+
+# Estimate within-dataset correlation
+dup_corr_enoc <- limma::duplicateCorrelation(
+  expr_enoc,
+  design_enoc,
+  block = meta_enoc$batch_1
+)
+
+# Fit the linear model
+fit_enoc <- limma::lmFit(
+  expr_enoc,
+  design_enoc,
+  block = meta_enoc$batch_1,
+  correlation = dup_corr_enoc$consensus
+)
+
+# Define the EnOC-versus-normal contrast
+contrast_enoc <- limma::makeContrasts(
+  EnOC_vs_Normal = EnOC - Normal,
+  levels = design_enoc
+)
+
+# Apply the contrast and empirical Bayes moderation
+fit2_enoc <- limma::contrasts.fit(
+  fit_enoc,
+  contrast_enoc
+)
+
+fit2_enoc <- limma::eBayes(
+  fit2_enoc
+)
+
+# Extract all results
+results_enoc <- limma::topTable(
+  fit2_enoc,
+  coef = "EnOC_vs_Normal",
+  adjust.method = "BH",
+  number = Inf,
+  sort.by = "P"
+)
+
+
+# Add Ensembl identifiers and remove version suffixes
+results_enoc$ensembl_gene_id <- sub(
+  "\\..*$",
+  "",
+  rownames(results_enoc)
+)
+
+
+# Select significant EnOC DEGs
+sig_genes_enoc <- results_enoc[
+  !is.na(results_enoc$adj.P.Val) &
+    results_enoc$adj.P.Val < 0.05 &
+    abs(results_enoc$logFC) > 1,
+  ,
+  drop = FALSE
+]
+
+cat(
+  "Significant EnOC DEGs:",
+  nrow(sig_genes_enoc),
+  "\n"
+)
+
+
+cat("Significant EnOC DEGs:",nrow(sig_genes_occc),"\n")
+cat("Upregulated:", sum(results_enoc$logFC > 1), "\n")
+cat("Downregulated:", sum(results_enoc$logFC < -1), "\n")
+
+############################################################
+# EXPORT EnOC DIFFERENTIAL-EXPRESSION RESULTS TO EXCEL
+############################################################
+
+
+results_enoc$ensembl_gene_id <- sub(
+  "\\..*$",
+  "",
+  rownames(results_enoc)
+)
+
+
+
+# 3. Separate upregulated and downregulated DEGs
+
+
+upregulated_enoc <- sig_genes_enoc[
+  sig_genes_enoc$logFC > 1,
+  ,
+  drop = FALSE
+]
+
+downregulated_enoc <- sig_genes_enoc[
+  sig_genes_enoc$logFC < -1,
+  ,
+  drop = FALSE
+]
+
+
+# 4. Print correct counts
+
+
+cat(
+  "All genes tested:",
+  nrow(results_enoc),
+  "\n"
+)
+
+cat(
+  "Significant EnOC DEGs:",
+  nrow(sig_genes_enoc),
+  "\n"
+)
+
+cat(
+  "Significantly upregulated:",
+  nrow(upregulated_enoc),
+  "\n"
+)
+
+cat(
+  "Significantly downregulated:",
+  nrow(downregulated_enoc),
+  "\n"
+)
+
+stopifnot(
+  nrow(sig_genes_enoc) ==
+    nrow(upregulated_enoc) +
+    nrow(downregulated_enoc)
+)
+
+
+# 5. Create summary table
+
+
+enoc_summary <- data.frame(
+  Category = c(
+    "All genes tested",
+    "Significant DEGs",
+    "Significantly upregulated",
+    "Significantly downregulated"
+  ),
+  Number_of_genes = c(
+    nrow(results_enoc),
+    nrow(sig_genes_enoc),
+    nrow(upregulated_enoc),
+    nrow(downregulated_enoc)
+  ),
+  Definition = c(
+    "All genes included in the EnOC-versus-normal limma analysis",
+    "Adjusted P-value < 0.05 and absolute log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change > 1",
+    "Adjusted P-value < 0.05 and log2 fold change < -1"
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(enoc_summary)
+
+
+# 6. Define the requested output directory
+
+
+output_dir_enoc <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Supplementary_material/Supplementary_material"
+)
+
+dir.create(
+  output_dir_enoc,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir_enoc)
+)
+
+
+# 7. Convert result objects to ordinary data frames
+
+
+all_genes_export <- as.data.frame(
+  results_enoc
+)
+
+significant_export <- as.data.frame(
+  sig_genes_enoc
+)
+
+upregulated_export <- as.data.frame(
+  upregulated_enoc
+)
+
+downregulated_export <- as.data.frame(
+  downregulated_enoc
+)
+
+# Move the Ensembl identifier to the first column
+move_id_first <- function(x) {
+  
+  x[
+    ,
+    c(
+      "ensembl_gene_id",
+      setdiff(
+        colnames(x),
+        "ensembl_gene_id"
+      )
+    ),
+    drop = FALSE
+  ]
+}
+
+all_genes_export <- move_id_first(
+  all_genes_export
+)
+
+significant_export <- move_id_first(
+  significant_export
+)
+
+upregulated_export <- move_id_first(
+  upregulated_export
+)
+
+downregulated_export <- move_id_first(
+  downregulated_export
+)
+
+
+# 8. Create the Excel workbook
+
+
+enoc_workbook <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(
+  enoc_workbook,
+  "Summary"
+)
+
+openxlsx::addWorksheet(
+  enoc_workbook,
+  "All_genes"
+)
+
+openxlsx::addWorksheet(
+  enoc_workbook,
+  "Significant_DEGs"
+)
+
+openxlsx::addWorksheet(
+  enoc_workbook,
+  "Upregulated"
+)
+
+openxlsx::addWorksheet(
+  enoc_workbook,
+  "Downregulated"
+)
+
+
+# 9. Write results to the workbook
+
+
+openxlsx::writeData(
+  enoc_workbook,
+  sheet = "Summary",
+  x = enoc_summary,
+  withFilter = TRUE
+)
+
+openxlsx::writeData(
+  enoc_workbook,
+  sheet = "All_genes",
+  x = all_genes_export,
+  withFilter = TRUE
+)
+
+openxlsx::writeData(
+  enoc_workbook,
+  sheet = "Significant_DEGs",
+  x = significant_export,
+  withFilter = TRUE
+)
+
+openxlsx::writeData(
+  enoc_workbook,
+  sheet = "Upregulated",
+  x = upregulated_export,
+  withFilter = TRUE
+)
+
+openxlsx::writeData(
+  enoc_workbook,
+  sheet = "Downregulated",
+  x = downregulated_export,
+  withFilter = TRUE
+)
+
+
+# 10. Format the workbook
+
+
+header_style <- openxlsx::createStyle(
+  fontSize = 11,
+  fontColour = "#FFFFFF",
+  fgFill = "#4F81BD",
+  textDecoration = "bold",
+  halign = "center",
+  border = "bottom"
+)
+
+sheet_names <- c(
+  "Summary",
+  "All_genes",
+  "Significant_DEGs",
+  "Upregulated",
+  "Downregulated"
+)
+
+for (sheet_name in sheet_names) {
+  
+  openxlsx::addStyle(
+    enoc_workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(
+      ncol(
+        switch(
+          sheet_name,
+          Summary = enoc_summary,
+          All_genes = all_genes_export,
+          Significant_DEGs = significant_export,
+          Upregulated = upregulated_export,
+          Downregulated = downregulated_export
+        )
+      )
+    ),
+    gridExpand = TRUE
+  )
+  
+  openxlsx::freezePane(
+    enoc_workbook,
+    sheet = sheet_name,
+    firstRow = TRUE
+  )
+  
+  openxlsx::setColWidths(
+    enoc_workbook,
+    sheet = sheet_name,
+    cols = 1:ncol(
+      switch(
+        sheet_name,
+        Summary = enoc_summary,
+        All_genes = all_genes_export,
+        Significant_DEGs = significant_export,
+        Upregulated = upregulated_export,
+        Downregulated = downregulated_export
+      )
+    ),
+    widths = "auto"
+  )
+}
+
+
+# 11. Save the workbook
+
+
+enoc_excel_file <- file.path(
+  output_dir_enoc,
+  "EnOC_vs_Normal_differential_expression_results.xlsx"
+)
+
+openxlsx::saveWorkbook(
+  enoc_workbook,
+  file = enoc_excel_file,
+  overwrite = TRUE
+)
+
+stopifnot(
+  file.exists(enoc_excel_file)
+)
+
+cat(
+  "Excel workbook saved to:\n",
+  normalizePath(
+    enoc_excel_file,
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  "\n"
+)
+
+
+#########################################################################
+## Functional Enrichment Analysis 
+#########################################################################
+
+##------------------OCCC--------------------------------------##
+
+# 1. Extract significant OCCC Ensembl identifiers
+
+
+gene_list_occc <- unique(
+  sub(
+    "\\..*$",
+    "",
+    as.character(
+      sig_genes_occc$ensembl_gene_id
+    )
+  )
+)
+
+# Remove missing, blank or invalid identifiers
+gene_list_occc <- gene_list_occc[
+  !is.na(gene_list_occc) &
+    gene_list_occc != "" &
+    grepl(
+      "^ENSG[0-9]+$",
+      gene_list_occc
+    )
+]
+
+# Quick checks
+head(gene_list_occc)
+length(gene_list_occc)
+
+stopifnot(
+  length(gene_list_occc) > 0
+)
+
+
+
+# 2. Run g:Profiler
+
+
+gprof_res_occc <- gprofiler2::gost(
+  query = gene_list_occc,
+  organism = "hsapiens",
+  sources = c(
+    "GO:BP",
+    "GO:MF",
+    "GO:CC",
+    "KEGG"
+  ),
+  correction_method = "fdr"
+)
+
+if (
+  is.null(gprof_res_occc) ||
+  is.null(gprof_res_occc$result)
+) {
+  stop("No enrichment results were returned.")
+}
+
+gprof_df_occc <- as.data.frame(
+  gprof_res_occc$result
+)
+
+head(gprof_df_occc)
+table(gprof_df_occc$source)
+
+
+# 3. Plotting function matched to original code
+
+
+
+plot_gprof_dot <- function(
+    df,
+    source_name,
+    title_text
+) {
+  
+  df %>%
+    dplyr::filter(
+      source == source_name
+    ) %>%
+    dplyr::arrange(
+      p_value
+    ) %>%
+    head(30) %>%
+    dplyr::mutate(
+      term_name = factor(
+        term_name,
+        levels = rev(term_name)
+      ),
+      
+      # This matches the calculation in the original code
+      FoldEnriched =
+        intersection_size / term_size,
+      
+      EnrichmentFDR =
+        -log10(
+          pmax(
+            p_value,
+            .Machine$double.xmin
+          )
+        )
+    ) %>%
+    ggplot2::ggplot(
+      aes(
+        x = FoldEnriched,
+        y = term_name
+      )
+    ) +
+    ggplot2::geom_point(
+      aes(
+        size = intersection_size,
+        colour = EnrichmentFDR
+      )
+    ) +
+    ggplot2::scale_colour_gradient(
+      low = "blue",
+      high = "red"
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(3, 8)
+    ) +
+    ggplot2::labs(
+      title = title_text,
+      x = "Fold Enrichment",
+      y = NULL,
+      colour = expression(
+        -log[10](p ~ value)
+      ),
+      size = "Gene count"
+    ) +
+    ggplot2::theme_minimal(
+      base_size = 13
+    ) +
+    ggplot2::theme(
+      axis.text.y = element_text(
+        size = 10
+      ),
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 14
+      ),
+      legend.position = "right"
+    )
+}
+
+
+# 4. Create the four enrichment plots
+
+
+p_bp_dot_occc <- plot_gprof_dot(
+  gprof_df_occc,
+  "GO:BP",
+  "GO Biological Process in OCCC"
+)
+
+p_mf_dot_occc <- plot_gprof_dot(
+  gprof_df_occc,
+  "GO:MF",
+  "GO Molecular Function in OCCC"
+)
+
+p_cc_dot_occc <- plot_gprof_dot(
+  gprof_df_occc,
+  "GO:CC",
+  "GO Cellular Component in OCCC"
+)
+
+p_kegg_dot_occc <- plot_gprof_dot(
+  gprof_df_occc,
+  "KEGG",
+  "KEGG Pathways in OCCC"
+)
+
+
+# 5. Combine and display the plots
+
+occc_enrichment_figure <- (
+  p_bp_dot_occc |
+    p_mf_dot_occc
+) / (
+  p_cc_dot_occc |
+    p_kegg_dot_occc
+) +
+  patchwork::plot_annotation(
+    title = paste(
+      "Functional enrichment analysis of differentially",
+      "expressed genes in OCCC"
+    ),
+    tag_levels = "A",
+    theme = ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 18,
+        margin = ggplot2::margin(
+          b = 12
+        )
+      ),
+      plot.tag = ggplot2::element_text(
+        face = "bold",
+        size = 15
+      )
+    )
+  )
+
+print(
+  occc_enrichment_figure
+)
+
+
+# 6. Save the combined figure
+
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/Submission images"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir)
+)
+
+normalizePath(
+  output_dir,
+  winslash = "/",
+  mustWork = TRUE
+)
+
+occc_enrichment_file <- file.path(
+  output_dir,
+  "OCCC_functional_enrichment_original_style.png"
+)
+
+ggplot2::ggsave(
+  filename = occc_enrichment_file,
+  plot = occc_enrichment_figure,
+  width = 16,
+  height = 12,
+  units = "in",
+  dpi = 300,
+  limitsize = FALSE,
+  bg = "white"
+)
+
+stopifnot(
+  file.exists(occc_enrichment_file)
+)
+
+browseURL(
+  normalizePath(
+    occc_enrichment_file,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+
+# Save as vector PDF
+
+
+occc_enrichment_pdf <- file.path(
+  output_dir,
+  "OCCC_functional_enrichment_ABCD.pdf"
+)
+
+ggplot2::ggsave(
+  filename = occc_enrichment_pdf,
+  plot = occc_enrichment_figure,
+  device = grDevices::cairo_pdf,
+  width = 16,
+  height = 12,
+  units = "in",
+  bg = "white"
+)
+
+stopifnot(
+  file.exists(occc_enrichment_pdf)
+)
+
+browseURL(
+  normalizePath(
+    occc_enrichment_pdf,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+
+
+## Genes in each pathway 
+
+############################################################
+## OCCC: enriched pathways, associated genes, and mTOR genes
+############################################################
+
+
+############################################################
+## 1. Select the top 30 pathways from each enrichment source
+############################################################
+
+top_pathways_occc <- gprof_df_occc %>%
+  dplyr::group_by(
+    source
+  ) %>%
+  dplyr::arrange(
+    p_value,
+    .by_group = TRUE
+  ) %>%
+  dplyr::slice_head(
+    n = 30
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    p_value,
+    intersection_size,
+    term_size
+  )
+
+
+############################################################
+## 2. Select all enriched pathways
+############################################################
+
+all_pathways_occc <- gprof_df_occc %>%
+  dplyr::arrange(
+    source,
+    p_value
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    p_value,
+    intersection_size,
+    term_size
+  )
+
+
+############################################################
+## 3. Map significant Ensembl IDs to Entrez IDs and symbols
+############################################################
+
+gene_mapping_occc <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = unique(
+    gene_list_occc
+  ),
+  keytype = "ENSEMBL",
+  columns = c(
+    "ENTREZID",
+    "SYMBOL"
+  )
+) %>%
+  dplyr::filter(
+    !is.na(ENTREZID),
+    !is.na(SYMBOL)
+  ) %>%
+  dplyr::distinct()
+
+
+############################################################
+## 4. Obtain GO gene memberships for all enriched GO terms
+############################################################
+
+all_go_terms_occc <- all_pathways_occc %>%
+  dplyr::filter(
+    source %in% c(
+      "GO:BP",
+      "GO:MF",
+      "GO:CC"
+    )
+  )
+
+go_membership_occc <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = unique(
+    all_go_terms_occc$term_id
+  ),
+  keytype = "GOALL",
+  columns = "ENTREZID"
+) %>%
+  dplyr::filter(
+    !is.na(ENTREZID)
+  ) %>%
+  dplyr::select(
+    term_id = GOALL,
+    ENTREZID
+  ) %>%
+  dplyr::distinct()
+
+
+############################################################
+## 5. Obtain KEGG pathway gene memberships
+############################################################
+
+kegg_links_occc <- KEGGREST::keggLink(
+  "hsa",
+  "pathway"
+)
+
+kegg_membership_occc <- data.frame(
+  term_id = paste0(
+    "KEGG:",
+    sub(
+      "^path:hsa",
+      "",
+      names(kegg_links_occc)
+    )
+  ),
+  ENTREZID = sub(
+    "^hsa:",
+    "",
+    unname(kegg_links_occc)
+  ),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::distinct()
+
+
+############################################################
+## 6. Define a function to extract genes for selected pathways
+############################################################
+
+extract_occc_pathway_genes <- function(
+    selected_pathways,
+    gene_mapping,
+    go_membership,
+    kegg_membership
+) {
+  
+  selected_go_terms <- selected_pathways %>%
+    dplyr::filter(
+      source %in% c(
+        "GO:BP",
+        "GO:MF",
+        "GO:CC"
+      )
+    )
+  
+  selected_go_genes <- selected_go_terms %>%
+    dplyr::inner_join(
+      go_membership,
+      by = "term_id",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::inner_join(
+      gene_mapping,
+      by = "ENTREZID",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::select(
+      source,
+      term_id,
+      term_name,
+      FDR = p_value,
+      reported_gene_count = intersection_size,
+      pathway_size = term_size,
+      ensembl_gene_id = ENSEMBL,
+      gene_symbol = SYMBOL,
+      entrez_id = ENTREZID
+    ) %>%
+    dplyr::distinct()
+  
+  selected_kegg_terms <- selected_pathways %>%
+    dplyr::filter(
+      source == "KEGG"
+    )
+  
+  selected_kegg_genes <- selected_kegg_terms %>%
+    dplyr::inner_join(
+      kegg_membership,
+      by = "term_id",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::inner_join(
+      gene_mapping,
+      by = "ENTREZID",
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::select(
+      source,
+      term_id,
+      term_name,
+      FDR = p_value,
+      reported_gene_count = intersection_size,
+      pathway_size = term_size,
+      ensembl_gene_id = ENSEMBL,
+      gene_symbol = SYMBOL,
+      entrez_id = ENTREZID
+    ) %>%
+    dplyr::distinct()
+  
+  dplyr::bind_rows(
+    selected_go_genes,
+    selected_kegg_genes
+  ) %>%
+    dplyr::arrange(
+      source,
+      FDR,
+      term_name,
+      gene_symbol
+    )
+}
+
+
+############################################################
+## 7. Extract genes for the top 30 pathways
+############################################################
+
+pathway_genes_occc <- extract_occc_pathway_genes(
+  selected_pathways = top_pathways_occc,
+  gene_mapping = gene_mapping_occc,
+  go_membership = go_membership_occc,
+  kegg_membership = kegg_membership_occc
+)
+
+
+############################################################
+## 8. Extract genes for all enriched pathways
+############################################################
+
+all_pathway_genes_occc <- extract_occc_pathway_genes(
+  selected_pathways = all_pathways_occc,
+  gene_mapping = gene_mapping_occc,
+  go_membership = go_membership_occc,
+  kegg_membership = kegg_membership_occc
+)
+
+
+############################################################
+## 9. Define a function to summarize pathway-associated genes
+############################################################
+
+summarise_occc_pathway_genes <- function(
+    pathway_gene_table
+) {
+  
+  pathway_gene_table %>%
+    dplyr::group_by(
+      source,
+      term_id,
+      term_name,
+      FDR,
+      reported_gene_count,
+      pathway_size
+    ) %>%
+    dplyr::summarise(
+      recovered_gene_count = dplyr::n_distinct(
+        ensembl_gene_id
+      ),
+      gene_symbols = paste(
+        sort(
+          unique(
+            gene_symbol[
+              !is.na(gene_symbol)
+            ]
+          )
+        ),
+        collapse = ", "
+      ),
+      ensembl_gene_ids = paste(
+        sort(
+          unique(
+            ensembl_gene_id
+          )
+        ),
+        collapse = ", "
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(
+      source,
+      FDR
+    )
+}
+
+
+############################################################
+## 10. Summarize the top 30 pathways
+############################################################
+
+pathway_gene_summary_occc <- summarise_occc_pathway_genes(
+  pathway_genes_occc
+)
+
+
+############################################################
+## 11. Summarize all enriched pathways
+############################################################
+
+all_pathway_gene_summary_occc <-
+  summarise_occc_pathway_genes(
+    all_pathway_genes_occc
+  )
+
+
+############################################################
+## 12. Extract gene-level logFC and adjusted P values
+############################################################
+
+occc_gene_statistics <- sig_genes_occc %>%
+  dplyr::transmute(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(
+        ensembl_gene_id
+      )
+    ),
+    logFC = as.numeric(
+      logFC
+    ),
+    gene_FDR = as.numeric(
+      adj.P.Val
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(logFC),
+    !is.na(gene_FDR)
+  ) %>%
+  dplyr::arrange(
+    gene_FDR
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    .keep_all = TRUE
+  )
+
+
+############################################################
+## 13. Add logFC values to genes in the top 30 pathways
+############################################################
+
+top_pathway_genes_occc_logFC <- pathway_genes_occc %>%
+  dplyr::left_join(
+    occc_gene_statistics,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::filter(
+    !is.na(logFC)
+  ) %>%
+  dplyr::mutate(
+    direction = dplyr::if_else(
+      logFC > 0,
+      "Upregulated",
+      "Downregulated"
+    ),
+    absolute_logFC = abs(
+      logFC
+    )
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR = FDR,
+    reported_gene_count,
+    pathway_size,
+    gene_symbol,
+    ensembl_gene_id,
+    logFC,
+    gene_FDR,
+    direction,
+    absolute_logFC
+  ) %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR,
+    term_name,
+    dplyr::desc(
+      absolute_logFC
+    )
+  )
+
+
+############################################################
+## 14. Identify genes belonging to the KEGG mTOR pathway
+############################################################
+
+mtor_genes_occc <- kegg_membership_occc %>%
+  dplyr::filter(
+    term_id == "KEGG:04150"
+  ) %>%
+  dplyr::inner_join(
+    gene_mapping_occc,
+    by = "ENTREZID",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::transmute(
+    entrez_id = ENTREZID,
+    ensembl_gene_id = ENSEMBL,
+    gene_symbol = SYMBOL
+  ) %>%
+  dplyr::filter(
+    !is.na(gene_symbol)
+  ) %>%
+  dplyr::distinct()
+
+
+############################################################
+## 15. Identify mTOR genes in all enriched OCCC pathways
+############################################################
+
+mtor_pathway_genes_occc <- all_pathway_genes_occc %>%
+  dplyr::semi_join(
+    mtor_genes_occc,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::left_join(
+    occc_gene_statistics,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::filter(
+    !is.na(logFC)
+  ) %>%
+  dplyr::mutate(
+    direction = dplyr::if_else(
+      logFC > 0,
+      "Upregulated",
+      "Downregulated"
+    ),
+    absolute_logFC = abs(
+      logFC
+    )
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR = FDR,
+    reported_gene_count,
+    pathway_size,
+    gene_symbol,
+    ensembl_gene_id,
+    logFC,
+    gene_FDR,
+    direction,
+    absolute_logFC
+  ) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR,
+    term_name,
+    dplyr::desc(
+      absolute_logFC
+    )
+  )
+
+
+############################################################
+## 16. Summarize mTOR-associated genes in each pathway
+############################################################
+
+mtor_pathway_summary_occc <- mtor_pathway_genes_occc %>%
+  dplyr::group_by(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR,
+    reported_gene_count,
+    pathway_size
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(
+      absolute_logFC
+    ),
+    .by_group = TRUE
+  ) %>%
+  dplyr::summarise(
+    number_mtor_genes = dplyr::n_distinct(
+      gene_symbol
+    ),
+    mtor_genes = paste(
+      unique(
+        gene_symbol
+      ),
+      collapse = ", "
+    ),
+    leading_mtor_genes = paste(
+      head(
+        unique(
+          gene_symbol
+        ),
+        10
+      ),
+      collapse = ", "
+    ),
+    leading_mtor_genes_logFC = paste(
+      head(
+        sprintf(
+          "%s (%+.2f)",
+          gene_symbol,
+          logFC
+        ),
+        10
+      ),
+      collapse = ", "
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR
+  )
+
+
+############################################################
+## 17. Confirm the output directory exists
+############################################################
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+
+############################################################
+## 18. Export the main enrichment workbook
+############################################################
+
+occc_pathway_workbook <- openxlsx::createWorkbook()
+
+
+# Sheet 1: all enriched pathways.
+
+openxlsx::addWorksheet(
+  occc_pathway_workbook,
+  sheetName = "All enriched pathways"
+)
+
+openxlsx::writeData(
+  occc_pathway_workbook,
+  sheet = "All enriched pathways",
+  x = all_pathway_gene_summary_occc,
+  withFilter = TRUE
+)
+
+
+# Sheet 2: top 30 pathways.
+
+openxlsx::addWorksheet(
+  occc_pathway_workbook,
+  sheetName = "Top 30 pathways"
+)
+
+openxlsx::writeData(
+  occc_pathway_workbook,
+  sheet = "Top 30 pathways",
+  x = pathway_gene_summary_occc,
+  withFilter = TRUE
+)
+
+
+# Sheet 3: individual genes and logFC values.
+
+openxlsx::addWorksheet(
+  occc_pathway_workbook,
+  sheetName = "Top 30 genes and logFC"
+)
+
+openxlsx::writeData(
+  occc_pathway_workbook,
+  sheet = "Top 30 genes and logFC",
+  x = top_pathway_genes_occc_logFC,
+  withFilter = TRUE
+)
+
+
+# Freeze the header row in each worksheet.
+
+for (
+  sheet_name in c(
+    "All enriched pathways",
+    "Top 30 pathways",
+    "Top 30 genes and logFC"
+  )
+) {
+  
+  openxlsx::freezePane(
+    occc_pathway_workbook,
+    sheet = sheet_name,
+    firstRow = TRUE
+  )
+}
+
+
+# Save the main workbook.
+
+occc_pathway_excel_file <- file.path(
+  output_dir,
+  "OCCC_enriched_pathways_gene_summaries.xlsx"
+)
+
+openxlsx::saveWorkbook(
+  occc_pathway_workbook,
+  file = occc_pathway_excel_file,
+  overwrite = TRUE
+)
+
+
+############################################################
+## 19. Export the mTOR pathway summary separately
+############################################################
+
+occc_mtor_excel_file <- file.path(
+  output_dir,
+  "OCCC_mTOR_pathway_summary.xlsx"
+)
+
+openxlsx::write.xlsx(
+  mtor_pathway_summary_occc,
+  file = occc_mtor_excel_file,
+  overwrite = TRUE
+)
+##-------------------------------------EnOC----------------------------------##
+
+
+# 1. Extract significant EnOC Ensembl identifiers
+
+
+gene_list_enoc <- unique(
+  sub(
+    "\\..*$",
+    "",
+    as.character(
+      sig_genes_enoc$ensembl_gene_id
+    )
+  )
+)
+
+# Remove missing, blank or invalid identifiers
+gene_list_enoc <- gene_list_enoc[
+  !is.na(gene_list_enoc) &
+    gene_list_enoc != "" &
+    grepl(
+      "^ENSG[0-9]+$",
+      gene_list_enoc
+    )
+]
+
+# Quick checks
+head(gene_list_enoc)
+length(gene_list_enoc)
+
+stopifnot(
+  length(gene_list_enoc) > 0
+)
+
+
+# 2. Run g:Profiler
+
+
+gprof_res_enoc <- gprofiler2::gost(
+  query = gene_list_enoc,
+  organism = "hsapiens",
+  sources = c(
+    "GO:BP",
+    "GO:MF",
+    "GO:CC",
+    "KEGG"
+  ),
+  correction_method = "fdr"
+)
+
+if (
+  is.null(gprof_res_enoc) ||
+  is.null(gprof_res_enoc$result)
+) {
+  stop("No EnOC enrichment results were returned.")
+}
+
+gprof_df_enoc <- as.data.frame(
+  gprof_res_enoc$result
+)
+
+head(gprof_df_enoc)
+table(gprof_df_enoc$source)
+
+
+# 3. Enrichment plotting function
+
+
+plot_gprof_dot_enoc <- function(
+    df,
+    source_name,
+    title_text
+) {
+  
+  df %>%
+    dplyr::filter(
+      source == source_name
+    ) %>%
+    dplyr::arrange(
+      p_value
+    ) %>%
+    head(30) %>%
+    dplyr::mutate(
+      term_name = factor(
+        term_name,
+        levels = rev(term_name)
+      ),
+      
+      FoldEnriched =
+        intersection_size / term_size,
+      
+      EnrichmentFDR =
+        -log10(
+          pmax(
+            p_value,
+            .Machine$double.xmin
+          )
+        )
+    ) %>%
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = FoldEnriched,
+        y = term_name
+      )
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(
+        size = intersection_size,
+        colour = EnrichmentFDR
+      )
+    ) +
+    ggplot2::scale_colour_gradient(
+      low = "blue",
+      high = "red"
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(3, 8)
+    ) +
+    ggplot2::labs(
+      title = title_text,
+      x = "Fold Enrichment",
+      y = NULL,
+      colour = expression(
+        -log[10](p ~ value)
+      ),
+      size = "Gene count"
+    ) +
+    ggplot2::theme_minimal(
+      base_size = 13
+    ) +
+    ggplot2::theme(
+      axis.text.y = ggplot2::element_text(
+        size = 10
+      ),
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 14
+      ),
+      legend.position = "right"
+    )
+}
+
+# 4. Create the four EnOC enrichment panels
+
+
+p_bp_dot_enoc <- plot_gprof_dot_enoc(
+  gprof_df_enoc,
+  "GO:BP",
+  "GO Biological Process in EnOC"
+)
+
+p_mf_dot_enoc <- plot_gprof_dot_enoc(
+  gprof_df_enoc,
+  "GO:MF",
+  "GO Molecular Function in EnOC"
+)
+
+p_cc_dot_enoc <- plot_gprof_dot_enoc(
+  gprof_df_enoc,
+  "GO:CC",
+  "GO Cellular Component in EnOC"
+)
+
+p_kegg_dot_enoc <- plot_gprof_dot_enoc(
+  gprof_df_enoc,
+  "KEGG",
+  "KEGG Pathways in EnOC"
+)
+
+
+# 5. Combine and display the panels
+
+
+enoc_enrichment_figure <- (
+  p_bp_dot_enoc |
+    p_mf_dot_enoc
+) / (
+  p_cc_dot_enoc |
+    p_kegg_dot_enoc
+) +
+  patchwork::plot_annotation(
+    title = paste(
+      "Functional enrichment analysis of differentially",
+      "expressed genes in EnOC"
+    ),
+    tag_levels = "A",
+    theme = ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 18,
+        margin = ggplot2::margin(
+          b = 12
+        )
+      ),
+      plot.tag = ggplot2::element_text(
+        face = "bold",
+        size = 15
+      )
+    )
+  )
+
+print(
+  enoc_enrichment_figure
+)
+
+
+# 6. Define and create the output directory
+
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/Submission images"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir)
+)
+
+
+# 7. Save as high-resolution PNG
+
+
+enoc_enrichment_png <- file.path(
+  output_dir,
+  "EnOC_functional_enrichment_ABCD.png"
+)
+
+ggplot2::ggsave(
+  filename = enoc_enrichment_png,
+  plot = enoc_enrichment_figure,
+  width = 16,
+  height = 12,
+  units = "in",
+  dpi = 300,
+  limitsize = FALSE,
+  bg = "white"
+)
+
+stopifnot(
+  file.exists(enoc_enrichment_png)
+)
+
+
+# 8. Save as vector PDF
+
+
+enoc_enrichment_pdf <- file.path(
+  output_dir,
+  "EnOC_functional_enrichment_ABCD.pdf"
+)
+
+ggplot2::ggsave(
+  filename = enoc_enrichment_pdf,
+  plot = enoc_enrichment_figure,
+  device = grDevices::cairo_pdf,
+  width = 16,
+  height = 12,
+  units = "in",
+  bg = "white"
+)
+
+stopifnot(
+  file.exists(enoc_enrichment_pdf)
+)
+
+
+# 10. Open the saved files
+
+
+browseURL(
+  normalizePath(
+    enoc_enrichment_png,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+browseURL(
+  normalizePath(
+    enoc_enrichment_pdf,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+############################################################
+## EnOC: extract genes for top 30 and all enriched pathways
+############################################################
+
+
+## 1. Map EnOC Ensembl IDs to Entrez IDs and gene symbols
+
+gene_mapping_enoc <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = unique(gene_list_enoc),
+  keytype = "ENSEMBL",
+  columns = c(
+    "ENTREZID",
+    "SYMBOL"
+  )
+) %>%
+  dplyr::filter(
+    !is.na(ENTREZID)
+  ) %>%
+  dplyr::distinct()
+
+head(gene_mapping_enoc)
+
+nrow(gene_mapping_enoc)
+
+
+
+## 2. Download KEGG membership once
+
+
+kegg_links_enoc <- KEGGREST::keggLink(
+  "hsa",
+  "pathway"
+)
+
+kegg_membership_enoc <- data.frame(
+  term_id = paste0(
+    "KEGG:",
+    sub(
+      "^path:hsa",
+      "",
+      names(kegg_links_enoc)
+    )
+  ),
+  ENTREZID = sub(
+    "^hsa:",
+    "",
+    unname(kegg_links_enoc)
+  ),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::distinct()
+
+head(kegg_membership_enoc)
+
+
+
+## 3. Function to extract genes for selected pathways
+
+
+extract_enoc_pathway_genes <- function(
+    selected_pathways,
+    gene_mapping,
+    kegg_membership
+) {
+  
+  # Select GO terms
+  
+  selected_go_terms <- selected_pathways %>%
+    dplyr::filter(
+      source %in% c(
+        "GO:BP",
+        "GO:MF",
+        "GO:CC"
+      )
+    )
+  
+  # Retrieve genes annotated to selected GO terms
+  
+  if (nrow(selected_go_terms) > 0) {
+    
+    selected_go_membership <- AnnotationDbi::select(
+      org.Hs.eg.db::org.Hs.eg.db,
+      keys = unique(selected_go_terms$term_id),
+      keytype = "GOALL",
+      columns = "ENTREZID"
+    ) %>%
+      dplyr::filter(
+        !is.na(ENTREZID)
+      ) %>%
+      dplyr::select(
+        term_id = GOALL,
+        ENTREZID
+      ) %>%
+      dplyr::distinct()
+    
+    selected_go_genes <- selected_go_terms %>%
+      dplyr::inner_join(
+        selected_go_membership,
+        by = "term_id",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::inner_join(
+        gene_mapping,
+        by = "ENTREZID",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::select(
+        source,
+        term_id,
+        term_name,
+        FDR = p_value,
+        reported_gene_count = intersection_size,
+        pathway_size = term_size,
+        ensembl_gene_id = ENSEMBL,
+        gene_symbol = SYMBOL,
+        entrez_id = ENTREZID
+      ) %>%
+      dplyr::distinct()
+    
+  } else {
+    
+    selected_go_genes <- data.frame()
+  }
+  
+  # Select KEGG pathways
+  
+  selected_kegg_terms <- selected_pathways %>%
+    dplyr::filter(
+      source == "KEGG"
+    )
+  
+  # Retrieve genes belonging to selected KEGG pathways
+  
+  if (nrow(selected_kegg_terms) > 0) {
+    
+    selected_kegg_genes <- selected_kegg_terms %>%
+      dplyr::inner_join(
+        kegg_membership,
+        by = "term_id",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::inner_join(
+        gene_mapping,
+        by = "ENTREZID",
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::select(
+        source,
+        term_id,
+        term_name,
+        FDR = p_value,
+        reported_gene_count = intersection_size,
+        pathway_size = term_size,
+        ensembl_gene_id = ENSEMBL,
+        gene_symbol = SYMBOL,
+        entrez_id = ENTREZID
+      ) %>%
+      dplyr::distinct()
+    
+  } else {
+    
+    selected_kegg_genes <- data.frame()
+  }
+  
+  # Combine GO and KEGG genes
+  
+  dplyr::bind_rows(
+    selected_go_genes,
+    selected_kegg_genes
+  ) %>%
+    dplyr::arrange(
+      source,
+      FDR,
+      term_name,
+      gene_symbol
+    )
+}
+
+
+
+## 4. Function to make one row per pathway
+
+
+summarise_enoc_pathway_genes <- function(pathway_gene_table) {
+  
+  pathway_gene_table %>%
+    dplyr::group_by(
+      source,
+      term_id,
+      term_name,
+      FDR,
+      reported_gene_count,
+      pathway_size
+    ) %>%
+    dplyr::summarise(
+      recovered_gene_count = dplyr::n_distinct(
+        ensembl_gene_id
+      ),
+      
+      gene_symbols = paste(
+        sort(
+          unique(
+            gene_symbol[
+              !is.na(gene_symbol) &
+                gene_symbol != ""
+            ]
+          )
+        ),
+        collapse = ", "
+      ),
+      
+      ensembl_gene_ids = paste(
+        sort(
+          unique(
+            ensembl_gene_id[
+              !is.na(ensembl_gene_id) &
+                ensembl_gene_id != ""
+            ]
+          )
+        ),
+        collapse = ", "
+      ),
+      
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(
+      source,
+      FDR
+    )
+}
+
+
+
+## 5. Extract genes for top 30 pathways from each source
+
+
+top_pathways_enoc <- gprof_df_enoc %>%
+  dplyr::group_by(source) %>%
+  dplyr::arrange(
+    p_value,
+    .by_group = TRUE
+  ) %>%
+  dplyr::slice_head(
+    n = 30
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    p_value,
+    intersection_size,
+    term_size
+  )
+
+table(top_pathways_enoc$source)
+
+nrow(top_pathways_enoc)
+
+
+# Extract individual genes for the top pathways
+
+pathway_genes_enoc <- extract_enoc_pathway_genes(
+  selected_pathways = top_pathways_enoc,
+  gene_mapping = gene_mapping_enoc,
+  kegg_membership = kegg_membership_enoc
+)
+
+head(pathway_genes_enoc)
+
+nrow(pathway_genes_enoc)
+
+table(pathway_genes_enoc$source)
+
+
+## EnOC: gene-level data for top 30 pathways
+
+enoc_gene_statistics <- sig_genes_enoc %>%
+  dplyr::transmute(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(ensembl_gene_id)
+    ),
+    logFC = as.numeric(logFC),
+    gene_FDR = as.numeric(adj.P.Val)
+  ) %>%
+  dplyr::filter(
+    !is.na(ensembl_gene_id),
+    ensembl_gene_id != "",
+    is.finite(logFC),
+    !is.na(gene_FDR)
+  ) %>%
+  dplyr::arrange(
+    gene_FDR
+  ) %>%
+  dplyr::distinct(
+    ensembl_gene_id,
+    .keep_all = TRUE
+  )
+
+top_pathway_genes_enoc_logFC <- pathway_genes_enoc %>%
+  dplyr::left_join(
+    enoc_gene_statistics,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::filter(
+    !is.na(logFC)
+  ) %>%
+  dplyr::mutate(
+    direction = dplyr::if_else(
+      logFC > 0,
+      "Upregulated",
+      "Downregulated"
+    ),
+    absolute_logFC = abs(logFC)
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR = FDR,
+    reported_gene_count,
+    pathway_size,
+    gene_symbol,
+    ensembl_gene_id,
+    logFC,
+    gene_FDR,
+    direction,
+    absolute_logFC
+  ) %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR,
+    term_name,
+    dplyr::desc(absolute_logFC)
+  )
+
+
+# Create one row per top pathway
+
+pathway_gene_summary_enoc <- summarise_enoc_pathway_genes(
+  pathway_genes_enoc
+)
+
+head(pathway_gene_summary_enoc)
+
+nrow(pathway_gene_summary_enoc)
+
+table(pathway_gene_summary_enoc$source)
+
+
+
+## 6. Extract genes for all significant pathways
+
+
+all_pathways_enoc <- gprof_df_enoc %>%
+  dplyr::arrange(
+    source,
+    p_value
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    p_value,
+    intersection_size,
+    term_size
+  )
+
+table(all_pathways_enoc$source)
+
+nrow(all_pathways_enoc)
+
+
+# Extract individual genes for all pathways
+
+all_pathway_genes_enoc <- extract_enoc_pathway_genes(
+  selected_pathways = all_pathways_enoc,
+  gene_mapping = gene_mapping_enoc,
+  kegg_membership = kegg_membership_enoc
+)
+
+head(all_pathway_genes_enoc)
+
+nrow(all_pathway_genes_enoc)
+
+table(all_pathway_genes_enoc$source)
+
+
+# Create one row per pathway
+
+all_pathway_gene_summary_enoc <-
+  summarise_enoc_pathway_genes(
+    all_pathway_genes_enoc
+  )
+
+head(all_pathway_gene_summary_enoc)
+
+nrow(all_pathway_gene_summary_enoc)
+
+table(all_pathway_gene_summary_enoc$source)
+
+
+
+## 7. Check annotation recovery
+
+# Compare recovered counts with counts reported by g:Profiler
+
+top_count_check_enoc <- pathway_gene_summary_enoc %>%
+  dplyr::mutate(
+    count_difference =
+      recovered_gene_count - reported_gene_count
+  )
+
+all_count_check_enoc <-
+  all_pathway_gene_summary_enoc %>%
+  dplyr::mutate(
+    count_difference =
+      recovered_gene_count - reported_gene_count
+  )
+
+summary(top_count_check_enoc$count_difference)
+
+summary(all_count_check_enoc$count_difference)
+
+
+# Identify pathways for which no genes were recovered
+
+pathways_without_genes_enoc <- all_pathways_enoc %>%
+  dplyr::anti_join(
+    all_pathway_gene_summary_enoc,
+    by = c(
+      "source",
+      "term_id"
+    )
+  )
+
+nrow(pathways_without_genes_enoc)
+
+head(pathways_without_genes_enoc)
+
+
+
+## 8. Check Excel cell-length limit
+
+
+# Excel permits a maximum of 32,767 characters in one cell.
+
+excel_length_check_enoc <- all_pathway_gene_summary_enoc %>%
+  dplyr::transmute(
+    source,
+    term_id,
+    term_name,
+    gene_symbols_characters = nchar(gene_symbols),
+    ensembl_ids_characters = nchar(ensembl_gene_ids)
+  ) %>%
+  dplyr::filter(
+    gene_symbols_characters > 32767 |
+      ensembl_ids_characters > 32767
+  )
+
+nrow(excel_length_check_enoc)
+
+head(excel_length_check_enoc)
+
+
+
+## 9. Save EnOC summaries in one Excel workbook
+
+
+output_dir_enoc <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Supplementary_material/Supplementary_material"
+)
+
+dir.create(
+  output_dir_enoc,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir_enoc)
+)
+
+
+# Create workbook
+
+enoc_pathway_workbook <- openxlsx::createWorkbook()
+
+
+# Header style
+
+header_style_enoc <- openxlsx::createStyle(
+  fontColour = "#FFFFFF",
+  fgFill = "#4472C4",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  border = "Bottom"
+)
+
+
+# Sheet 1: all significant enriched pathways
+
+openxlsx::addWorksheet(
+  enoc_pathway_workbook,
+  sheetName = "All enriched pathways"
+)
+
+openxlsx::writeData(
+  enoc_pathway_workbook,
+  sheet = "All enriched pathways",
+  x = all_pathway_gene_summary_enoc,
+  withFilter = TRUE,
+  headerStyle = header_style_enoc
+)
+
+
+# Sheet 2: top 30 pathways from each source
+
+openxlsx::addWorksheet(
+  enoc_pathway_workbook,
+  sheetName = "Top 30 pathways"
+)
+
+openxlsx::writeData(
+  enoc_pathway_workbook,
+  sheet = "Top 30 pathways",
+  x = pathway_gene_summary_enoc,
+  withFilter = TRUE,
+  headerStyle = header_style_enoc
+)
+
+
+#Sheet 3 
+openxlsx::addWorksheet(
+  enoc_pathway_workbook,
+  sheetName = "Top 30 genes and logFC"
+)
+
+openxlsx::writeData(
+  enoc_pathway_workbook,
+  sheet = "Top 30 genes and logFC",
+  x = top_pathway_genes_enoc_logFC,
+  withFilter = TRUE,
+  headerStyle = header_style_enoc
+)
+
+
+# Freeze headers
+
+openxlsx::freezePane(
+  enoc_pathway_workbook,
+  sheet = "All enriched pathways",
+  firstRow = TRUE
+)
+
+openxlsx::freezePane(
+  enoc_pathway_workbook,
+  sheet = "Top 30 pathways",
+  firstRow = TRUE
+)
+
+
+# Set practical column widths
+
+openxlsx::setColWidths(
+  enoc_pathway_workbook,
+  sheet = "All enriched pathways",
+  cols = 1:7,
+  widths = c(
+    12, 16, 45, 14, 20, 15, 20
+  )
+)
+
+openxlsx::setColWidths(
+  enoc_pathway_workbook,
+  sheet = "All enriched pathways",
+  cols = 8:9,
+  widths = c(60, 60)
+)
+
+openxlsx::setColWidths(
+  enoc_pathway_workbook,
+  sheet = "Top 30 pathways",
+  cols = 1:7,
+  widths = c(
+    12, 16, 45, 14, 20, 15, 20
+  )
+)
+
+openxlsx::setColWidths(
+  enoc_pathway_workbook,
+  sheet = "Top 30 pathways",
+  cols = 8:9,
+  widths = c(60, 60)
+)
+
+
+# Save workbook
+
+enoc_pathway_excel_file <- file.path(
+  output_dir_enoc,
+  "EnOC_enriched_pathways_gene_summaries.xlsx"
+)
+
+openxlsx::saveWorkbook(
+  enoc_pathway_workbook,
+  file = enoc_pathway_excel_file,
+  overwrite = TRUE
+)
+
+stopifnot(
+  file.exists(enoc_pathway_excel_file)
+)
+
+normalizePath(
+  enoc_pathway_excel_file,
+  winslash = "/",
+  mustWork = TRUE
+)
+
+browseURL(
+  normalizePath(
+    enoc_pathway_excel_file,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+
+## mTOR genes involved in EnOC enriched pathways
+
+# Obtain genes belonging to the KEGG mTOR signalling pathway.
+mtor_genes_enoc <- kegg_membership_enoc %>%
+  dplyr::filter(
+    term_id == "KEGG:04150"
+  ) %>%
+  dplyr::inner_join(
+    gene_mapping_enoc,
+    by = "ENTREZID",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::transmute(
+    entrez_id = ENTREZID,
+    ensembl_gene_id = ENSEMBL,
+    gene_symbol = SYMBOL
+  ) %>%
+  dplyr::filter(
+    !is.na(gene_symbol)
+  ) %>%
+  dplyr::distinct()
+
+
+# Identify mTOR pathway genes in enriched EnOC pathways.
+mtor_pathway_genes_enoc <- all_pathway_genes_enoc %>%
+  dplyr::semi_join(
+    mtor_genes_enoc,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::left_join(
+    enoc_gene_statistics,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::filter(
+    !is.na(logFC)
+  ) %>%
+  dplyr::mutate(
+    direction = dplyr::if_else(
+      logFC > 0,
+      "Upregulated",
+      "Downregulated"
+    ),
+    absolute_logFC = abs(logFC)
+  ) %>%
+  dplyr::select(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR = FDR,
+    reported_gene_count,
+    pathway_size,
+    gene_symbol,
+    ensembl_gene_id,
+    logFC,
+    gene_FDR,
+    direction,
+    absolute_logFC
+  ) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR,
+    term_name,
+    dplyr::desc(absolute_logFC)
+  )
+
+
+# Summarize mTOR-associated genes in each enriched pathway.
+mtor_pathway_summary_enoc <- mtor_pathway_genes_enoc %>%
+  dplyr::group_by(
+    source,
+    term_id,
+    term_name,
+    pathway_FDR,
+    reported_gene_count,
+    pathway_size
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(absolute_logFC),
+    .by_group = TRUE
+  ) %>%
+  dplyr::summarise(
+    number_mtor_genes = dplyr::n_distinct(
+      gene_symbol
+    ),
+    mtor_genes = paste(
+      unique(gene_symbol),
+      collapse = ", "
+    ),
+    leading_mtor_genes = paste(
+      head(unique(gene_symbol), 10),
+      collapse = ", "
+    ),
+    leading_mtor_genes_logFC = paste(
+      head(
+        sprintf(
+          "%s (%+.2f)",
+          gene_symbol,
+          logFC
+        ),
+        10
+      ),
+      collapse = ", "
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    source,
+    pathway_FDR
+  )
+
+
+# Export the summary as an Excel file.
+openxlsx::write.xlsx(
+  mtor_pathway_summary_enoc,
+  file = file.path(output_dir_enoc, "EnOC_mTOR_pathway_summary.xlsx"),
+  overwrite = TRUE
+)
+
+
+##############################################################################
+## Pathview for both 
+##############################################################################
+
+
+## 1. Output directory
+
+
+pathview_output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Submission images/Pathview"
+)
+
+dir.create(
+  pathview_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(pathview_output_dir)
+)
+
+
+
+# Connect to an alternative Ensembl mirror
+
+mart <- biomaRt::useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "useast"
+)
+
+
+# Collect Ensembl identifiers from OCCC and EnOC
+
+ensembl_ids <- unique(
+  c(
+    sig_genes_occc$ensembl_gene_id,
+    sig_genes_enoc$ensembl_gene_id
+  )
+)
+
+ensembl_ids <- sub(
+  "\\..*$",
+  "",
+  as.character(ensembl_ids)
+)
+
+ensembl_ids <- ensembl_ids[
+  !is.na(ensembl_ids) &
+    ensembl_ids != "" &
+    grepl(
+      "^ENSG[0-9]+$",
+      ensembl_ids
+    )
+]
+
+length(ensembl_ids)
+
+
+
+# Split identifiers into batches of 500 genes
+
+ensembl_batches <- split(
+  ensembl_ids,
+  ceiling(
+    seq_along(ensembl_ids) / 500
+  )
+)
+
+length(ensembl_batches)
+
+
+# Retrieve gene symbols one batch at a time
+
+gene_symbol_batches <- lapply(
+  seq_along(ensembl_batches),
+  
+  function(batch_number) {
+    
+    message(
+      "Processing batch ",
+      batch_number,
+      " of ",
+      length(ensembl_batches)
+    )
+    
+    biomaRt::getBM(
+      attributes = c(
+        "ensembl_gene_id",
+        "hgnc_symbol"
+      ),
+      filters = "ensembl_gene_id",
+      values = ensembl_batches[[batch_number]],
+      mart = mart,
+      useCache = FALSE
+    )
+  }
+)
+
+
+# Combine results
+
+gene_symbols <- dplyr::bind_rows(
+  gene_symbol_batches
+) %>%
+  dplyr::filter(
+    !is.na(hgnc_symbol),
+    hgnc_symbol != ""
+  ) %>%
+  dplyr::distinct()
+
+head(gene_symbols)
+
+nrow(gene_symbols)
+
+
+# Add gene symbols to OCCC significant genes
+
+sig_genes_occc_pathview <- sig_genes_occc %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(ensembl_gene_id)
+    )
+  ) %>%
+  dplyr::inner_join(
+    gene_symbols,
+    by = "ensembl_gene_id",
+    relationship = "many-to-many"
+  )
+
+
+# Add gene symbols to EnOC significant genes
+
+sig_genes_enoc_pathview <- sig_genes_enoc %>%
+  dplyr::mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      as.character(ensembl_gene_id)
+    )
+  ) %>%
+  dplyr::inner_join(
+    gene_symbols,
+    by = "ensembl_gene_id",
+    relationship = "many-to-many"
+  )
+
+
+#Pathview 
+
+
+
+##------- OCCC: mTOR signaling pathway --------##
+
+
+# Create named numeric vector of logFC
+
+gene_data_occc <- sig_genes_occc_pathview$logFC
+
+names(gene_data_occc) <-
+  sig_genes_occc_pathview$hgnc_symbol
+
+
+# Remove missing or empty gene symbols and invalid logFC values
+
+keep_occc <- !is.na(
+  names(gene_data_occc)
+) &
+  names(gene_data_occc) != "" &
+  is.finite(gene_data_occc)
+
+gene_data_occc <- gene_data_occc[
+  keep_occc
+]
+
+
+# Collapse duplicated gene symbols by mean logFC
+
+gene_data_occc_df <- data.frame(
+  symbol = names(gene_data_occc),
+  logFC = as.numeric(gene_data_occc)
+)
+
+gene_data_occc_df <- aggregate(
+  logFC ~ symbol,
+  data = gene_data_occc_df,
+  FUN = mean
+)
+
+gene_data_occc <- gene_data_occc_df$logFC
+
+names(gene_data_occc) <-
+  gene_data_occc_df$symbol
+
+
+# Check prepared data
+
+head(gene_data_occc)
+
+length(gene_data_occc)
+
+stopifnot(
+  length(gene_data_occc) > 0
+)
+
+
+##---------EnOC----------------------------##
+
+# Create named numeric vector of logFC
+
+gene_data_enoc <- sig_genes_enoc_pathview$logFC
+
+names(gene_data_enoc) <-
+  sig_genes_enoc_pathview$hgnc_symbol
+
+
+# Remove missing or empty gene symbols and invalid logFC values
+
+keep_enoc <- !is.na(
+  names(gene_data_enoc)
+) &
+  names(gene_data_enoc) != "" &
+  is.finite(gene_data_enoc)
+
+gene_data_enoc <- gene_data_enoc[
+  keep_enoc
+]
+
+
+# Collapse duplicated gene symbols by mean logFC
+
+gene_data_enoc_df <- data.frame(
+  symbol = names(gene_data_enoc),
+  logFC = as.numeric(gene_data_enoc)
+)
+
+gene_data_enoc_df <- aggregate(
+  logFC ~ symbol,
+  data = gene_data_enoc_df,
+  FUN = mean
+)
+
+gene_data_enoc <- gene_data_enoc_df$logFC
+
+names(gene_data_enoc) <-
+  gene_data_enoc_df$symbol
+
+
+# Check prepared data
+
+head(gene_data_enoc)
+
+length(gene_data_enoc)
+
+stopifnot(
+  length(gene_data_enoc) > 0
+)
+
+
+##-------------Pathview-------------------------------##
+
+
+## 2. Define the KEGG pathway files
+
+pathway_xml_file <- file.path(
+  pathview_output_dir,
+  "hsa04150.xml"
+)
+
+pathway_png_file <- file.path(
+  pathview_output_dir,
+  "hsa04150.png"
+)
+
+
+
+## 3. Remove existing pathway files if present
+
+
+if (
+  file.exists(pathway_xml_file)
+) {
+  
+  file.remove(
+    pathway_xml_file
+  )
+  
+}
+
+if (
+  file.exists(pathway_png_file)
+) {
+  
+  file.remove(
+    pathway_png_file
+  )
+  
+}
+
+
+
+## 4. Download a fresh mTOR pathway XML file
+
+
+options(
+  timeout = 600
+)
+
+download.file(
+  url = "https://rest.kegg.jp/get/hsa04150/kgml",
+  destfile = pathway_xml_file,
+  mode = "wb",
+  method = "libcurl"
+)
+
+
+
+## 5. Download a fresh mTOR pathway image
+
+
+download.file(
+  url = "https://rest.kegg.jp/get/hsa04150/image",
+  destfile = pathway_png_file,
+  mode = "wb",
+  method = "libcurl"
+)
+
+
+
+## 6. Confirm both files exist and are not empty
+
+
+stopifnot(
+  file.exists(pathway_xml_file),
+  file.exists(pathway_png_file),
+  file.info(pathway_xml_file)$size > 0,
+  file.info(pathway_png_file)$size > 0
+)
+
+file.info(
+  pathway_xml_file
+)$size
+
+file.info(
+  pathway_png_file
+)$size
+
+
+# Check that the downloaded XML can be parsed
+
+XML::xmlParse(
+  pathway_xml_file
+)
+
+
+
+## 7. Generate both Pathview diagrams
+
+
+original_working_directory <- getwd()
+
+tryCatch(
+  
+  {
+    
+    setwd(
+      pathview_output_dir
+    )
+    
+    
+    # OCCC mTOR pathway
+    
+    pathview_occc <- pathview::pathview(
+      gene.data = gene_data_occc,
+      
+      pathway.id = "hsa04150",
+      
+      species = "hsa",
+      
+      gene.idtype = "SYMBOL",
+      
+      out.suffix = "OCCC_mTOR_logFC",
+      
+      kegg.native = TRUE,
+      
+      low = list(
+        gene = "red"
+      ),
+      
+      mid = list(
+        gene = "white"
+      ),
+      
+      high = list(
+        gene = "green"
+      ),
+      
+      limit = list(
+        gene = 1,
+        cpd = 1
+      )
+    )
+    
+    
+    # EnOC mTOR pathway
+    
+    pathview_enoc <- pathview::pathview(
+      gene.data = gene_data_enoc,
+      
+      pathway.id = "hsa04150",
+      
+      species = "hsa",
+      
+      gene.idtype = "SYMBOL",
+      
+      out.suffix = "EnOC_mTOR_logFC",
+      
+      kegg.native = TRUE,
+      
+      low = list(
+        gene = "red"
+      ),
+      
+      mid = list(
+        gene = "white"
+      ),
+      
+      high = list(
+        gene = "green"
+      ),
+      
+      limit = list(
+        gene = 1,
+        cpd = 1
+      )
+    )
+    
+  },
+  
+  finally = {
+    
+    setwd(
+      original_working_directory
+    )
+    
+  }
+  
+)
+
+
+
+## 8. Locate and open generated images
+
+occc_pathview_png <- file.path(
+  pathview_output_dir,
+  "hsa04150.OCCC_mTOR_logFC.png"
+)
+
+enoc_pathview_png <- file.path(
+  pathview_output_dir,
+  "hsa04150.EnOC_mTOR_logFC.png"
+)
+
+stopifnot(
+  file.exists(occc_pathview_png),
+  file.exists(enoc_pathview_png)
+)
+
+browseURL(
+  normalizePath(
+    occc_pathview_png,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+browseURL(
+  normalizePath(
+    enoc_pathview_png,
+    winslash = "/",
+    mustWork = TRUE
+  )
+)
+
+##########################################################################
+## Venn diagram of DEGs in both subtypes DEGs
+#########################################################################
+
+
+
+# Extract significant OCCC genes.
+
+occc_venn_genes <- results_occc %>%
+  dplyr::filter(
+    !is.na(adj.P.Val),
+    !is.na(logFC),
+    adj.P.Val < 0.05,
+    abs(logFC) > 1
+  ) %>%
+  dplyr::pull(
+    ensembl_gene_id
+  ) %>%
+  as.character() %>%
+  sub(
+    "\\..*$",
+    "",
+    .
+  ) %>%
+  unique()
+
+occc_venn_genes <- occc_venn_genes[
+  !is.na(occc_venn_genes) &
+    occc_venn_genes != ""
+]
+
+
+# Extract significant EnOC genes.
+
+enoc_venn_genes <- results_enoc %>%
+  dplyr::filter(
+    !is.na(adj.P.Val),
+    !is.na(logFC),
+    adj.P.Val < 0.05,
+    abs(logFC) > 1
+  ) %>%
+  dplyr::pull(
+    ensembl_gene_id
+  ) %>%
+  as.character() %>%
+  sub(
+    "\\..*$",
+    "",
+    .
+  ) %>%
+  unique()
+
+enoc_venn_genes <- enoc_venn_genes[
+  !is.na(enoc_venn_genes) &
+    enoc_venn_genes != ""
+]
+
+
+# Identify shared and subtype-specific genes.
+
+shared_deg_genes <- intersect(
+  occc_venn_genes,
+  enoc_venn_genes
+)
+
+occc_only_deg_genes <- setdiff(
+  occc_venn_genes,
+  enoc_venn_genes
+)
+
+enoc_only_deg_genes <- setdiff(
+  enoc_venn_genes,
+  occc_venn_genes
+)
+
+total_unique_deg_genes <- length(
+  union(
+    occc_venn_genes,
+    enoc_venn_genes
+  )
+)
+
+stopifnot(
+  total_unique_deg_genes > 0
+)
+
+
+# Calculate counts and percentages.
+
+occc_only_n <- length(
+  occc_only_deg_genes
+)
+
+shared_n <- length(
+  shared_deg_genes
+)
+
+enoc_only_n <- length(
+  enoc_only_deg_genes
+)
+
+occc_only_percentage <- 100 *
+  occc_only_n /
+  total_unique_deg_genes
+
+shared_percentage <- 100 *
+  shared_n /
+  total_unique_deg_genes
+
+enoc_only_percentage <- 100 *
+  enoc_only_n /
+  total_unique_deg_genes
+
+
+# Create a summary data frame.
+
+deg_overlap_summary <- data.frame(
+  category = c(
+    "OCCC only",
+    "Shared OCCC and EnOC",
+    "EnOC only"
+  ),
+  gene_count = c(
+    occc_only_n,
+    shared_n,
+    enoc_only_n
+  ),
+  percentage = c(
+    occc_only_percentage,
+    shared_percentage,
+    enoc_only_percentage
+  )
+)
+
+
+# Generate coordinates for two vertically overlapping circles.
+
+circle_points <- seq(
+  0,
+  2 * pi,
+  length.out = 500
+)
+
+circle_radius <- 1.4
+
+occc_circle <- data.frame(
+  x = circle_radius * cos(
+    circle_points
+  ),
+  y = 0.65 + circle_radius * sin(
+    circle_points
+  )
+)
+
+enoc_circle <- data.frame(
+  x = circle_radius * cos(
+    circle_points
+  ),
+  y = -0.65 + circle_radius * sin(
+    circle_points
+  )
+)
+
+
+# Create the Venn diagram.
+
+deg_venn_plot <- ggplot2::ggplot() +
+  
+  ggplot2::geom_polygon(
+    data = occc_circle,
+    ggplot2::aes(
+      x = x,
+      y = y
+    ),
+    fill = "#BFD3E6",
+    colour = "#333333",
+    linewidth = 0.8,
+    alpha = 0.65
+  ) +
+  
+  ggplot2::geom_polygon(
+    data = enoc_circle,
+    ggplot2::aes(
+      x = x,
+      y = y
+    ),
+    fill = "#6BAED6",
+    colour = "#333333",
+    linewidth = 0.8,
+    alpha = 0.65
+  ) +
+  
+  ggplot2::annotate(
+    "text",
+    x = 0,
+    y = 1.15,
+    label = paste0(
+      format(
+        occc_only_n,
+        big.mark = ","
+      ),
+      "\n(",
+      sprintf(
+        "%.1f",
+        occc_only_percentage
+      ),
+      "%)"
+    ),
+    size = 4
+  ) +
+  
+  ggplot2::annotate(
+    "text",
+    x = 0,
+    y = 0,
+    label = paste0(
+      format(
+        shared_n,
+        big.mark = ","
+      ),
+      "\n(",
+      sprintf(
+        "%.1f",
+        shared_percentage
+      ),
+      "%)"
+    ),
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  
+  ggplot2::annotate(
+    "text",
+    x = 0,
+    y = -1.15,
+    label = paste0(
+      format(
+        enoc_only_n,
+        big.mark = ","
+      ),
+      "\n(",
+      sprintf(
+        "%.1f",
+        enoc_only_percentage
+      ),
+      "%)"
+    ),
+    size = 4
+  ) +
+  
+  ggplot2::annotate(
+    "text",
+    x = -1.65,
+    y = 0.95,
+    label = "OCCC",
+    fontface = "bold",
+    hjust = 1,
+    size = 4
+  ) +
+  
+  ggplot2::annotate(
+    "text",
+    x = -1.65,
+    y = -0.95,
+    label = "EnOC",
+    fontface = "bold",
+    hjust = 1,
+    size = 4
+  ) +
+  
+  ggplot2::coord_equal(
+    xlim = c(
+      -2.2,
+      1.8
+    ),
+    ylim = c(
+      -2.3,
+      2.3
+    ),
+    clip = "off"
+  ) +
+  
+  ggplot2::labs(
+    title = "Overlap of significant genes: EnOC vs OCCC"
+  ) +
+  
+  ggplot2::theme_void() +
+  
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 12
+    ),
+    plot.margin = ggplot2::margin(
+      15,
+      20,
+      15,
+      20
+    )
+  )
+
+print(
+  deg_venn_plot
+)
+
+
+# Save the figure.
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "OCCC_EnOC_DEG_Venn_diagram.png"
+  ),
+  plot = deg_venn_plot,
+  width = 6,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "OCCC_EnOC_DEG_Venn_diagram.pdf"
+  ),
+  plot = deg_venn_plot,
+  width = 6,
+  height = 7,
+  units = "in",
+  device = grDevices::cairo_pdf,
+  bg = "white"
+)
+
+file.path(output_dir, "OCCC_EnOC_DEG_Venn_diagram.png")
+file.path(output_dir, "OCCC_EnOC_DEG_Venn_diagram.pdf")
+
+############################################################################################
+### Volcano Plot ## Not done of the revised version 
+############################################################################################
+
+# Copy results table
+results_plot <- results_EAOC
+
+# Create regulation category
+results_plot$Regulation <- "Not Significant"
+
+results_plot$Regulation[results_plot$adj.P.Val < 0.05 & results_plot$logFC > 1] <- "Upregulated"
+results_plot$Regulation[results_plot$adj.P.Val < 0.05 & results_plot$logFC < -1] <- "Downregulated"
+
+
+ggplot(results_plot, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = Regulation), alpha = 0.7, size = 1.5) +
+  
+  scale_color_manual(
+    values = c(
+      "Upregulated" = "maroon",
+      "Downregulated" = "darkblue",
+      "Not Significant" = "grey"
+    )
+  ) +
+  
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed",
+    color = "blue",
+    linewidth = 1
+  ) +
+  
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    color = "green",
+    linewidth = 1
+  ) +
+  
+  labs(
+    title = "Differential Gene Expression in EAOCs vs Normal Ovarian Tissue",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+
+######################################################################
+##EoC Vs OCCC concordance 
+#####################################################################
+
+############################################################
+## OCCC–EnOC effect-size concordance
+##
+## Uses existing results:
+##   results_occc = OCCC versus normal
+##   results_enoc = EnOC versus normal
+##
+## These are the same results used for:
+##   Functional enrichment
+##   mTOR analysis
+##   Venn diagram
+############################################################
+
+
+############################################################
+## 1. Confirm required objects already exist
+############################################################
+
+stopifnot(
+  exists("results_occc"),
+  exists("results_enoc"),
+  exists("expr_new2"),
+  exists("meta2"),
+  exists("output_dir")
+)
+
+
+############################################################
+## 2. Prepare metadata for subsequent heatmap and UMAP
+############################################################
+
+meta2a <- as.data.frame(
+  meta2
+)
+
+meta2a$Type_original <- as.character(
+  meta2a$Type
+)
+
+meta2a$Type <- dplyr::recode(
+  meta2a$Type_original,
+  "healthy" = "Normal",
+  "EE" = "EnOC",
+  "CC" = "OCCC",
+  .default = meta2a$Type_original
+)
+
+meta2a$Type <- factor(
+  meta2a$Type,
+  levels = c(
+    "Normal",
+    "EnOC",
+    "OCCC"
+  )
+)
+
+stopifnot(
+  !anyNA(
+    meta2a$Type
+  ),
+  ncol(expr_new2) == nrow(meta2a),
+  identical(
+    colnames(expr_new2),
+    rownames(meta2a)
+  )
+)
+
+
+############################################################
+## 3. Prepare existing subtype-specific results
+############################################################
+
+prepare_subtype_result <- function(
+    result_object,
+    subtype_name
+) {
+  
+  result_data <- as.data.frame(
+    result_object
+  )
+  
+  required_columns <- c(
+    "logFC",
+    "adj.P.Val"
+  )
+  
+  if (
+    !all(
+      required_columns %in%
+      colnames(result_data)
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "Required columns are missing from ",
+        subtype_name,
+        " results."
+      )
+    )
+  }
+  
+  if (
+    "ensembl_gene_id" %in%
+    colnames(result_data)
+  ) {
+    
+    result_data$ensembl_gene_id <-
+      as.character(
+        result_data$ensembl_gene_id
+      )
+    
+  } else if (
+    all(
+      grepl(
+        "^ENSG",
+        rownames(result_data)
+      )
+    )
+  ) {
+    
+    result_data$ensembl_gene_id <-
+      rownames(
+        result_data
+      )
+    
+  } else {
+    
+    stop(
+      paste0(
+        "Ensembl gene identifiers are missing from ",
+        subtype_name,
+        " results."
+      )
+    )
+  }
+  
+  result_data %>%
+    dplyr::mutate(
+      ensembl_gene_id = sub(
+        "\\..*$",
+        "",
+        ensembl_gene_id
+      )
+    ) %>%
+    dplyr::filter(
+      !is.na(ensembl_gene_id),
+      ensembl_gene_id != "",
+      is.finite(logFC)
+    ) %>%
+    dplyr::arrange(
+      adj.P.Val
+    ) %>%
+    dplyr::distinct(
+      ensembl_gene_id,
+      .keep_all = TRUE
+    ) %>%
+    dplyr::select(
+      ensembl_gene_id,
+      logFC,
+      adj.P.Val
+    ) %>%
+    dplyr::rename(
+      !!paste0(
+        "logFC_",
+        subtype_name
+      ) := logFC,
+      
+      !!paste0(
+        "adj_P_",
+        subtype_name
+      ) := adj.P.Val
+    )
+}
+
+
+############################################################
+## 4. Prepare OCCC and EnOC results
+############################################################
+
+OCCC_result_for_plot <- prepare_subtype_result(
+  result_object = results_occc,
+  subtype_name = "OCCC"
+)
+
+EnOC_result_for_plot <- prepare_subtype_result(
+  result_object = results_enoc,
+  subtype_name = "EnOC"
+)
+
+
+############################################################
+## 5. Match all genes tested in both histotypes
+############################################################
+
+all_gene_concordance <- OCCC_result_for_plot %>%
+  dplyr::inner_join(
+    EnOC_result_for_plot,
+    by = "ensembl_gene_id"
+  ) %>%
+  dplyr::filter(
+    is.finite(logFC_OCCC),
+    is.finite(logFC_EnOC)
+  ) %>%
+  dplyr::mutate(
+    
+    same_direction =
+      sign(logFC_OCCC) ==
+      sign(logFC_EnOC),
+    
+    significant_OCCC =
+      !is.na(adj_P_OCCC) &
+      adj_P_OCCC < 0.05 &
+      abs(logFC_OCCC) > 1,
+    
+    significant_EnOC =
+      !is.na(adj_P_EnOC) &
+      adj_P_EnOC < 0.05 &
+      abs(logFC_EnOC) > 1,
+    
+    significance_group = dplyr::case_when(
+      
+      significant_OCCC &
+        significant_EnOC ~
+        "Significant in both",
+      
+      significant_OCCC &
+        !significant_EnOC ~
+        "OCCC only",
+      
+      !significant_OCCC &
+        significant_EnOC ~
+        "EnOC only",
+      
+      TRUE ~
+        "Significant in neither"
+    ),
+    
+    effect_difference =
+      logFC_OCCC - logFC_EnOC,
+    
+    absolute_effect_difference =
+      abs(
+        effect_difference
+      )
+  )
+
+stopifnot(
+  nrow(all_gene_concordance) > 1
+)
+
+
+############################################################
+## 6. Concordance across all commonly tested genes
+############################################################
+
+all_gene_spearman <- stats::cor(
+  all_gene_concordance$logFC_OCCC,
+  all_gene_concordance$logFC_EnOC,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+all_gene_same_direction_percentage <- 100 *
+  mean(
+    all_gene_concordance$same_direction,
+    na.rm = TRUE
+  )
+
+
+############################################################
+## 7. Identify genes significant in both histotypes
+############################################################
+
+subtype_concordance_both <- all_gene_concordance %>%
+  dplyr::filter(
+    significant_OCCC,
+    significant_EnOC
+  ) %>%
+  dplyr::mutate(
+    effect_direction = dplyr::case_when(
+      
+      logFC_OCCC > 0 &
+        logFC_EnOC > 0 ~
+        "Increased in both",
+      
+      logFC_OCCC < 0 &
+        logFC_EnOC < 0 ~
+        "Decreased in both",
+      
+      TRUE ~
+        "Opposing directions"
+    )
+  )
+
+if (
+  nrow(subtype_concordance_both) < 2
+) {
+  
+  stop(
+    paste(
+      "Fewer than two genes were significant",
+      "in both OCCC and EnOC."
+    )
+  )
+}
+
+
+############################################################
+## 8. Calculate concordance among shared significant DEGs
+############################################################
+
+subtype_spearman_both <- stats::cor(
+  subtype_concordance_both$logFC_OCCC,
+  subtype_concordance_both$logFC_EnOC,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+same_direction_n_both <- sum(
+  subtype_concordance_both$same_direction,
+  na.rm = TRUE
+)
+
+same_direction_percentage_both <- 100 *
+  mean(
+    subtype_concordance_both$same_direction,
+    na.rm = TRUE
+  )
+
+increased_in_both_n <- sum(
+  subtype_concordance_both$effect_direction ==
+    "Increased in both",
+  na.rm = TRUE
+)
+
+decreased_in_both_n <- sum(
+  subtype_concordance_both$effect_direction ==
+    "Decreased in both",
+  na.rm = TRUE
+)
+
+opposing_direction_n <- sum(
+  subtype_concordance_both$effect_direction ==
+    "Opposing directions",
+  na.rm = TRUE
+)
+
+
+############################################################
+## 9. Identify genes significant in one histotype only
+############################################################
+
+subtype_specific_significance <- all_gene_concordance %>%
+  dplyr::filter(
+    xor(
+      significant_OCCC,
+      significant_EnOC
+    )
+  ) %>%
+  dplyr::mutate(
+    significant_histotype = dplyr::case_when(
+      
+      significant_OCCC ~
+        "OCCC only",
+      
+      significant_EnOC ~
+        "EnOC only"
+    )
+  )
+
+occc_only_n <- sum(
+  subtype_specific_significance$significant_histotype ==
+    "OCCC only",
+  na.rm = TRUE
+)
+
+enoc_only_n <- sum(
+  subtype_specific_significance$significant_histotype ==
+    "EnOC only",
+  na.rm = TRUE
+)
+
+
+############################################################
+## 10. Concordance among genes significant in one subtype
+############################################################
+
+if (
+  nrow(subtype_specific_significance) > 1
+) {
+  
+  subtype_specific_spearman <- stats::cor(
+    subtype_specific_significance$logFC_OCCC,
+    subtype_specific_significance$logFC_EnOC,
+    method = "spearman",
+    use = "complete.obs"
+  )
+  
+  subtype_specific_same_direction_percentage <- 100 *
+    mean(
+      subtype_specific_significance$same_direction,
+      na.rm = TRUE
+    )
+  
+} else {
+  
+  subtype_specific_spearman <- NA_real_
+  
+  subtype_specific_same_direction_percentage <- NA_real_
+}
+
+
+############################################################
+## 11. Create one summary data frame
+############################################################
+
+concordance_summary <- data.frame(
+  
+  analysis = c(
+    "All commonly tested genes",
+    "Genes significant in both histotypes",
+    "Genes significant in one histotype only"
+  ),
+  
+  number_of_genes = c(
+    nrow(
+      all_gene_concordance
+    ),
+    nrow(
+      subtype_concordance_both
+    ),
+    nrow(
+      subtype_specific_significance
+    )
+  ),
+  
+  spearman_rho = c(
+    all_gene_spearman,
+    subtype_spearman_both,
+    subtype_specific_spearman
+  ),
+  
+  same_direction_percentage = c(
+    all_gene_same_direction_percentage,
+    same_direction_percentage_both,
+    subtype_specific_same_direction_percentage
+  )
+)
+
+
+############################################################
+## 12. Display the concordance results
+############################################################
+
+cat(
+  "Commonly tested genes:",
+  nrow(
+    all_gene_concordance
+  ),
+  "\n"
+)
+
+cat(
+  "Spearman correlation across all genes:",
+  round(
+    all_gene_spearman,
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "Same direction across all genes:",
+  round(
+    all_gene_same_direction_percentage,
+    1
+  ),
+  "%\n\n"
+)
+
+cat(
+  "Genes significant in both histotypes:",
+  nrow(
+    subtype_concordance_both
+  ),
+  "\n"
+)
+
+cat(
+  "Spearman correlation among shared DEGs:",
+  round(
+    subtype_spearman_both,
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "Shared DEGs showing the same direction:",
+  round(
+    same_direction_percentage_both,
+    1
+  ),
+  "%\n"
+)
+
+cat(
+  "Increased in both histotypes:",
+  increased_in_both_n,
+  "\n"
+)
+
+cat(
+  "Decreased in both histotypes:",
+  decreased_in_both_n,
+  "\n"
+)
+
+cat(
+  "Opposing directions:",
+  opposing_direction_n,
+  "\n\n"
+)
+
+cat(
+  "Genes significant in OCCC only:",
+  occc_only_n,
+  "\n"
+)
+
+cat(
+  "Genes significant in EnOC only:",
+  enoc_only_n,
+  "\n"
+)
+
+cat(
+  "Total significant in one histotype only:",
+  nrow(
+    subtype_specific_significance
+  ),
+  "\n"
+)
+
+cat(
+  "Spearman correlation among subtype-specific DEGs:",
+  round(
+    subtype_specific_spearman,
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "Subtype-specific DEGs showing the same direction:",
+  round(
+    subtype_specific_same_direction_percentage,
+    1
+  ),
+  "%\n"
+)
+
+
+############################################################
+## 13. Set equal axis limits using all commonly tested genes
+############################################################
+
+axis_limit <- ceiling(
+  max(
+    abs(
+      c(
+        all_gene_concordance$logFC_OCCC,
+        all_gene_concordance$logFC_EnOC
+      )
+    ),
+    na.rm = TRUE
+  )
+)
+
+
+############################################################
+## 14. Prepare the plot annotation
+############################################################
+
+annotation_text <- paste0(
+  "Spearman \u03c1 = ",
+  sprintf(
+    "%.3f",
+    all_gene_spearman
+  ),
+  "\nSame direction = ",
+  sprintf(
+    "%.1f",
+    all_gene_same_direction_percentage
+  ),
+  "%"
+)
+
+
+############################################################
+## 15. Create the all-gene concordance plot
+############################################################
+
+subtype_concordance_plot <- ggplot2::ggplot(
+  all_gene_concordance,
+  ggplot2::aes(
+    x = logFC_OCCC,
+    y = logFC_EnOC
+  )
+) +
+  ggplot2::geom_hline(
+    yintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    colour = "grey60",
+    linewidth = 0.4
+  ) +
+  ggplot2::geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    colour = "black",
+    linewidth = 0.7
+  ) +
+  ggplot2::geom_point(
+    colour = "#377EB8",
+    alpha = 0.3,
+    size = 0.8
+  ) +
+  ggplot2::annotate(
+    geom = "text",
+    x = -0.95 * axis_limit,
+    y = 0.95 * axis_limit,
+    label = annotation_text,
+    hjust = 0,
+    vjust = 1,
+    size = 3.5
+  ) +
+  ggplot2::coord_equal(
+    xlim = c(
+      -axis_limit,
+      axis_limit
+    ),
+    ylim = c(
+      -axis_limit,
+      axis_limit
+    ),
+    expand = FALSE
+  ) +
+  ggplot2::theme_bw(
+    base_size = 11
+  ) +
+  ggplot2::theme(
+    panel.grid.minor =
+      ggplot2::element_blank(),
+    plot.title =
+      ggplot2::element_text(
+        face = "bold",
+        size = 11
+      )
+  ) +
+  ggplot2::labs(
+    title = "Effect-size concordance across all tested genes",
+    x = "OCCC versus normal log2 fold change",
+    y = "EnOC versus normal log2 fold change"
+  )
+
+print(
+  subtype_concordance_plot
+)
+
+
+############################################################
+## 16. Save the all-gene concordance plot
+############################################################
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "OCCC_EnOC_all_gene_effect_size_concordance.png"
+  ),
+  plot = subtype_concordance_plot,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "OCCC_EnOC_all_gene_effect_size_concordance.pdf"
+  ),
+  plot = subtype_concordance_plot,
+  width = 7,
+  height = 7,
+  units = "in",
+  device = grDevices::cairo_pdf,
+  bg = "white"
+)
+############################################################
+## 17. Export the concordance summary
+############################################################
+
+openxlsx::write.xlsx(
+  concordance_summary,
+  file = file.path(
+    output_dir,
+    "OCCC_EnOC_concordance_summary.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+#############################################################
+## Heat map 
+#############################################################
+
+############################################################
+# HEATMAP OF TOP 100 VARIABLE CANCER GENES
+############################################################
+
+
+
+############################################################
+# 1. Prepare and validate expression data and metadata
+############################################################
+
+
+expr_new2_mat <- as.matrix(expr_new2)
+
+
+# meta2a should already be ordered to match expr_new2
+stopifnot(
+  identical(
+    colnames(expr_new2_mat),
+    rownames(meta2a)
+  ),
+  ncol(expr_new2_mat) == nrow(meta2a),
+  !anyDuplicated(colnames(expr_new2_mat)),
+  !anyDuplicated(rownames(expr_new2_mat))
+)
+
+# Make sure Type has the intended labels and order
+meta2a$Type <- factor(
+  as.character(meta2a$Type),
+  levels = c("Normal", "EnOC", "OCCC")
+)
+
+stopifnot(!anyNA(meta2a$Type))
+
+print(table(meta2a$Type))
+
+
+############################################################
+# 2. Select cancer samples only for variance calculation
+############################################################
+
+cancer_samples <- meta2a$Type %in% c(
+  "EnOC",
+  "OCCC"
+)
+
+expr_cancer <- expr_new2_mat[
+  ,
+  cancer_samples,
+  drop = FALSE
+]
+
+stopifnot(
+  ncol(expr_cancer) == 120
+)
+
+############################################################
+# 3. Calculate gene variance across EnOC and OCCC samples
+############################################################
+
+gene_variance <- matrixStats::rowVars(
+  expr_cancer,
+  na.rm = TRUE
+)
+
+names(gene_variance) <- rownames(expr_cancer)
+
+# Retain genes with finite, non-zero variance
+gene_variance <- gene_variance[
+  is.finite(gene_variance) &
+    gene_variance > 0
+]
+
+# Rank genes from highest to lowest variance
+gene_variance <- sort(
+  gene_variance,
+  decreasing = TRUE
+)
+
+top_n <- min(
+  100,
+  length(gene_variance)
+)
+
+top_var_genes <- names(
+  gene_variance
+)[seq_len(top_n)]
+
+length(top_var_genes)
+head(top_var_genes)
+
+############################################################
+# 4. Order all samples: Normal, EnOC and OCCC
+############################################################
+
+sample_order <- order(
+  meta2a$Type
+)
+
+meta_heatmap <- meta2a[
+  sample_order,
+  ,
+  drop = FALSE
+]
+
+ordered_samples <- rownames(
+  meta_heatmap
+)
+
+expr_heatmap <- expr_new2_mat[
+  top_var_genes,
+  ordered_samples,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(expr_heatmap),
+    rownames(meta_heatmap)
+  ),
+  nrow(expr_heatmap) == top_n
+)
+
+############################################################
+# 6. Create column annotation
+############################################################
+
+annotation_col <- data.frame(
+  Group = meta_heatmap$Type
+)
+
+rownames(annotation_col) <- rownames(
+  meta_heatmap
+)
+
+annotation_col$Group <- factor(
+  annotation_col$Group,
+  levels = c("Normal", "EnOC", "OCCC")
+)
+
+annotation_colors <- list(
+  Group = c(
+    "Normal" = "black",
+    "EnOC" = "#E69F00",
+    "OCCC" = "#D55E00"
+  )
+)
+
+############################################################
+# 7. Calculate gaps between groups
+############################################################
+
+group_sizes <- table(
+  annotation_col$Group
+)
+
+gaps_col <- cumsum(
+  as.numeric(group_sizes)
+)
+
+gaps_col <- gaps_col[
+  -length(gaps_col)
+]
+
+############################################################
+# 8. Standardize each gene across samples
+############################################################
+
+expr_heatmap_scaled <- t(
+  scale(
+    t(expr_heatmap)
+  )
+)
+
+valid_rows <- apply(
+  expr_heatmap_scaled,
+  1,
+  function(x) all(is.finite(x))
+)
+
+expr_heatmap_scaled <- expr_heatmap_scaled[
+  valid_rows,
+  ,
+  drop = FALSE
+]
+
+############################################################
+# 9. Check everything before plotting
+############################################################
+
+stopifnot(
+  identical(
+    colnames(expr_heatmap_scaled),
+    rownames(annotation_col)
+  )
+)
+
+dim(expr_heatmap_scaled)
+table(annotation_col$Group)
+gaps_col
+
+############################################################
+# 10. Plot the heatmap
+############################################################
+
+heatmap_result <- pheatmap::pheatmap(
+  mat = expr_heatmap_scaled,
+  scale = "none",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  clustering_distance_rows = "euclidean",
+  clustering_method = "complete",
+  color = colorRampPalette(
+    c("firebrick1", "white", "black")
+  )(100),
+  breaks = seq(-2, 2, length.out = 101),
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  gaps_col = gaps_col,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 5.5,
+  annotation_names_col = FALSE,
+  legend_breaks = c(-2, 0, 2),
+  legend_labels = c(
+    "Lower",
+    "Mean",
+    "Higher"
+  ),
+  border_color = NA,
+  silent = TRUE,
+  main = paste0(
+    "Top 100 most variable genes across EnOC and OCCC ",
+    "displayed across all sample groups"
+  )
+)
+
+
+############################################################
+# COMPLETE 3D UMAP WORKFLOW
+# EnOC and OCCC cancer samples
+############################################################
+
+
+
+
+set.seed(123)
+
+############################################################
+# 1. Output directory
+############################################################
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Submission images"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(
+  dir.exists(output_dir)
+)
+
+############################################################
+# 2. Prepare and validate expression matrix
+############################################################
+
+expr_new2_mat <- as.matrix(
+  expr_new2
+)
+
+storage.mode(expr_new2_mat) <- "numeric"
+
+stopifnot(
+  ncol(expr_new2_mat) == nrow(meta2a),
+  identical(
+    colnames(expr_new2_mat),
+    rownames(meta2a)
+  ),
+  !anyDuplicated(
+    colnames(expr_new2_mat)
+  )
+)
+
+############################################################
+# 3. Confirm histotype labels
+############################################################
+
+meta2a$Type <- factor(
+  as.character(meta2a$Type),
+  levels = c(
+    "Normal",
+    "EnOC",
+    "OCCC"
+  )
+)
+
+stopifnot(
+  !anyNA(meta2a$Type)
+)
+
+print(
+  table(meta2a$Type)
+)
+
+############################################################
+# 4. Select cancer samples only
+############################################################
+
+cancer_samples <- meta2a$Type %in% c(
+  "EnOC",
+  "OCCC"
+)
+
+expr_cancer <- expr_new2_mat[
+  ,
+  cancer_samples,
+  drop = FALSE
+]
+
+meta_cancer <- meta2a[
+  cancer_samples,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(expr_cancer),
+    rownames(meta_cancer)
+  ),
+  ncol(expr_cancer) == 120
+)
+
+print(
+  table(meta_cancer$Type)
+)
+
+############################################################
+# 5. Select the 2,000 most variable genes
+############################################################
+
+gene_variance <- matrixStats::rowVars(
+  expr_cancer,
+  na.rm = TRUE
+)
+
+names(gene_variance) <- rownames(
+  expr_cancer
+)
+
+valid_variance <- is.finite(
+  gene_variance
+) &
+  gene_variance > 0
+
+gene_variance <- gene_variance[
+  valid_variance
+]
+
+gene_variance <- sort(
+  gene_variance,
+  decreasing = TRUE
+)
+
+number_top_genes <- min(
+  2000,
+  length(gene_variance)
+)
+
+top_variable_genes <- names(
+  gene_variance
+)[seq_len(number_top_genes)]
+
+expr_cancer_variable <- expr_cancer[
+  top_variable_genes,
+  ,
+  drop = FALSE
+]
+
+print(
+  dim(expr_cancer_variable)
+)
+
+############################################################
+# 6. Standardize genes for UMAP
+############################################################
+
+# UMAP requires samples in rows and genes in columns
+umap_input <- t(
+  expr_cancer_variable
+)
+
+# Standardize each gene across samples
+umap_input <- scale(
+  umap_input,
+  center = TRUE,
+  scale = TRUE
+)
+
+# Remove any non-finite features
+valid_umap_features <- apply(
+  umap_input,
+  2,
+  function(x) {
+    all(is.finite(x))
+  }
+)
+
+umap_input <- umap_input[
+  ,
+  valid_umap_features,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(umap_input),
+    rownames(meta_cancer)
+  )
+)
+
+print(
+  dim(umap_input)
+)
+
+############################################################
+# 7. Configure three-dimensional UMAP
+############################################################
+
+umap_configuration_3d <- umap::umap.defaults
+
+umap_configuration_3d$n_components <- 3
+umap_configuration_3d$n_neighbors <- 15
+umap_configuration_3d$min_dist <- 0.1
+umap_configuration_3d$metric <- "euclidean"
+
+############################################################
+# 8. Run three-dimensional UMAP
+############################################################
+
+set.seed(123)
+
+umap_result_3d <- umap::umap(
+  umap_input,
+  config = umap_configuration_3d
+)
+
+############################################################
+# 9. Construct the UMAP plotting data
+############################################################
+
+umap_data_3d <- data.frame(
+  sample_id = rownames(meta_cancer),
+  UMAP1 = umap_result_3d$layout[, 1],
+  UMAP2 = umap_result_3d$layout[, 2],
+  UMAP3 = umap_result_3d$layout[, 3],
+  Histotype = factor(
+    as.character(meta_cancer$Type),
+    levels = c(
+      "EnOC",
+      "OCCC"
+    )
+  ),
+  Dataset = factor(
+    meta_cancer$batch_1
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(umap_data_3d) ==
+    nrow(meta_cancer),
+  !anyNA(
+    umap_data_3d$Histotype
+  ),
+  all(
+    is.finite(
+      as.matrix(
+        umap_data_3d[
+          ,
+          c(
+            "UMAP1",
+            "UMAP2",
+            "UMAP3"
+          )
+        ]
+      )
+    )
+  )
+)
+
+print(
+  table(
+    umap_data_3d$Histotype
+  )
+)
+
+################################################
+############################################################
+## 3D UMAP coloured by dataset and histotype,
+## without ellipsoids, using 3D spheres
+############################################################
+
+
+############################################################
+## 1. Load required packages
+############################################################
+
+library(rgl)
+library(png)
+
+
+############################################################
+## 2. Check existing UMAP coordinates
+############################################################
+
+stopifnot(
+  exists("umap_data_3d"),
+  
+  all(
+    c(
+      "UMAP1",
+      "UMAP2",
+      "UMAP3",
+      "Dataset",
+      "Histotype"
+    ) %in%
+      colnames(umap_data_3d)
+  ),
+  
+  !anyNA(umap_data_3d$Dataset),
+  
+  !anyNA(umap_data_3d$Histotype)
+)
+
+
+############################################################
+## 3. Combine dataset and histotype
+############################################################
+
+umap_data_3d$Dataset_Histotype <- factor(
+  paste(
+    as.character(
+      umap_data_3d$Dataset
+    ),
+    
+    as.character(
+      umap_data_3d$Histotype
+    ),
+    
+    sep = ": "
+  )
+)
+
+print(
+  table(
+    umap_data_3d$Dataset_Histotype
+  )
+)
+
+
+############################################################
+## 4. Assign distinctive colours
+############################################################
+
+group_colours <- c(
+  "GSE121103: EnOC" = "#0072B2",
+  "GSE121103: OCCC" = "#FF8C00",
+  
+  "GSE189553: EnOC" = "#009E73",
+  "GSE189553: OCCC" = "#FF00AA",
+  
+  "GSE226870: EnOC" = "#00CED1",
+  "GSE226870: OCCC" = "#E31A1C",
+  
+  "GSE230956: OCCC" = "#222222",
+  
+  "GSE295399: EnOC" = "#7B2CBF",
+  "GSE295399: OCCC" = "#FFD700"
+)
+
+missing_groups <- setdiff(
+  levels(
+    umap_data_3d$Dataset_Histotype
+  ),
+  
+  names(
+    group_colours
+  )
+)
+
+if (
+  length(missing_groups) > 0
+) {
+  
+  stop(
+    "No colours defined for: ",
+    
+    paste(
+      missing_groups,
+      
+      collapse = ", "
+    )
+  )
+  
+}
+
+point_colours <- unname(
+  group_colours[
+    as.character(
+      umap_data_3d$Dataset_Histotype
+    )
+  ]
+)
+
+stopifnot(
+  !anyNA(point_colours)
+)
+
+
+############################################################
+## 5. Calculate sphere size
+############################################################
+
+coordinate_range <- max(
+  c(
+    diff(
+      range(
+        umap_data_3d$UMAP1,
+        
+        na.rm = TRUE
+      )
+    ),
+    
+    diff(
+      range(
+        umap_data_3d$UMAP2,
+        
+        na.rm = TRUE
+      )
+    ),
+    
+    diff(
+      range(
+        umap_data_3d$UMAP3,
+        
+        na.rm = TRUE
+      )
+    )
+  )
+)
+
+sphere_radius <- coordinate_range * 0.018
+
+
+############################################################
+## 6. Create a clean 3D plotting window
+############################################################
+
+rgl::open3d()
+
+rgl::bg3d(
+  color = "white"
+)
+
+
+############################################################
+## 7. Draw illuminated 3D spheres
+############################################################
+
+rgl::spheres3d(
+  x = umap_data_3d$UMAP1,
+  
+  y = umap_data_3d$UMAP2,
+  
+  z = umap_data_3d$UMAP3,
+  
+  radius = sphere_radius,
+  
+  color = point_colours,
+  
+  alpha = 1,
+  
+  lit = TRUE,
+  
+  specular = "white",
+  
+  shininess = 70
+)
+
+
+############################################################
+## 8. Add larger, bold EnOC and OCCC labels
+############################################################
+
+# Position the EnOC label using all EnOC samples.
+
+enoc_coordinates <- as.matrix(
+  umap_data_3d[
+    as.character(
+      umap_data_3d$Histotype
+    ) == "EnOC",
+    
+    c(
+      "UMAP1",
+      "UMAP2",
+      "UMAP3"
+    )
+  ]
+)
+
+enoc_centre <- colMeans(
+  enoc_coordinates
+)
+
+rgl::texts3d(
+  x = enoc_centre[1],
+  
+  y = enoc_centre[2],
+  
+  z = enoc_centre[3] +
+    1.5 * stats::sd(
+      enoc_coordinates[, 3]
+    ),
+  
+  texts = "EnOC",
+  
+  color = "#0072B2",
+  
+  cex = 2.5,
+  
+  font = 2
+)
+
+
+# Position the OCCC label closer to the red
+# GSE226870 OCCC samples.
+
+occc_red_coordinates <- as.matrix(
+  umap_data_3d[
+    as.character(
+      umap_data_3d$Dataset_Histotype
+    ) == "GSE226870: OCCC",
+    
+    c(
+      "UMAP1",
+      "UMAP2",
+      "UMAP3"
+    )
+  ]
+)
+
+stopifnot(
+  nrow(occc_red_coordinates) > 0
+)
+
+occc_red_centre <- colMeans(
+  occc_red_coordinates
+)
+
+rgl::texts3d(
+  x = occc_red_centre[1],
+  
+  y = occc_red_centre[2] +
+    0.25 * coordinate_range,
+  
+  z = occc_red_centre[3],
+  
+  texts = "OCCC",
+  
+  color = "#E31A1C",
+  
+  cex = 2.5,
+  
+  font = 2
+)
+
+############################################################
+## 9. Add axes
+############################################################
+
+rgl::axes3d(
+  edges = c(
+    "x--",
+    "y--",
+    "z--"
+  ),
+  
+  color = "grey15",
+  
+  lwd = 2.5,
+  
+  cex = 1.5
+)
+
+
+############################################################
+## 10. Add axis titles
+############################################################
+
+rgl::title3d(
+  xlab = "UMAP1",
+  
+  ylab = "UMAP2",
+  
+  zlab = "UMAP3",
+  
+  color = "black",
+  
+  line = 3,
+  
+  cex = 1.5
+)
+
+
+############################################################
+## 11. Add grid lines
+############################################################
+
+rgl::grid3d(
+  side = c(
+    "x",
+    "y",
+    "z"
+  ),
+  
+  col = "grey75",
+  
+  lwd = 1.3
+)
+
+
+############################################################
+## 12. Add a bounding box
+############################################################
+
+rgl::bbox3d(
+  color = c(
+    "grey20",
+    "grey70"
+  ),
+  
+  emission = "grey70",
+  
+  specular = "black",
+  
+  shininess = 5,
+  
+  alpha = 0.9
+)
+
+
+############################################################
+## 13. Set the viewing angle
+############################################################
+
+rgl::view3d(
+  theta = 70,
+  
+  phi = 18,
+  
+  zoom = 0.78,
+  
+  fov = 30
+)
+
+
+############################################################
+## 14. Display the interactive UMAP
+############################################################
+
+umap_dataset_histotype_viewer <- rgl::rglwidget(
+  width = 900,
+  
+  height = 750
+)
+
+print(
+  umap_dataset_histotype_viewer
+)
+
+
+############################################################
+## 15. Define the output directory
+############################################################
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  
+  "Biochemistry submission/First revesion/",
+  
+  "Submission images"
+)
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+
+############################################################
+## 16. Save the initial 3D image
+############################################################
+
+plot_only_png <- file.path(
+  output_dir,
+  
+  "UMAP_3D_dataset_histotype_spheres_plot_only.png"
+)
+
+rgl::snapshot3d(
+  filename = plot_only_png,
+  
+  width = 1800,
+  
+  height = 1500,
+  
+  webshot = TRUE
+)
+
+stopifnot(
+  file.exists(
+    plot_only_png
+  )
+)
+
+
+############################################################
+## 17. Prepare legend labels
+############################################################
+
+group_counts <- table(
+  umap_data_3d$Dataset_Histotype
+)
+
+group_labels <- paste0(
+  names(group_counts),
+  
+  " (n = ",
+  
+  as.integer(group_counts),
+  
+  ")"
+)
+
+
+############################################################
+## 18. Read the saved 3D image
+############################################################
+
+umap_image <- png::readPNG(
+  plot_only_png
+)
+
+
+############################################################
+## 19. Create a function to draw the final figure
+############################################################
+
+draw_dataset_histotype_figure <- function() {
+  
+  graphics::par(
+    mar = c(
+      0,
+      0,
+      0,
+      0
+    ),
+    
+    xaxs = "i",
+    
+    yaxs = "i"
+  )
+  
+  graphics::plot.new()
+  
+  graphics::plot.window(
+    xlim = c(
+      0,
+      1
+    ),
+    
+    ylim = c(
+      0,
+      1
+    )
+  )
+  
+  graphics::rasterImage(
+    image = umap_image,
+    
+    xleft = 0,
+    
+    ybottom = 0,
+    
+    xright = 1,
+    
+    ytop = 1
+  )
+  
+  graphics::legend(
+    "topright",
+    
+    legend = group_labels,
+    
+    title = "Dataset and histotype",
+    
+    pch = 21,
+    
+    pt.bg = group_colours[
+      names(group_counts)
+    ],
+    
+    col = "grey20",
+    
+    pt.cex = 1.3,
+    
+    cex = 0.70,
+    
+    bty = "o",
+    
+    bg = "white",
+    
+    inset = 0.02
+  )
+  
+}
+
+
+############################################################
+## 20. Save the final figure as PNG
+############################################################
+
+final_png <- file.path(
+  output_dir,
+  
+  "UMAP_3D_dataset_histotype_spheres.png"
+)
+
+grDevices::png(
+  filename = final_png,
+  
+  width = 1800,
+  
+  height = 1500,
+  
+  res = 200,
+  
+  bg = "white"
+)
+
+draw_dataset_histotype_figure()
+
+grDevices::dev.off()
+
+
+############################################################
+## 21. Save the final figure as PDF
+############################################################
+
+final_pdf <- file.path(
+  output_dir,
+  
+  "UMAP_3D_dataset_histotype_spheres.pdf"
+)
+
+grDevices::pdf(
+  file = final_pdf,
+  
+  width = 9,
+  
+  height = 7.5,
+  
+  bg = "white"
+)
+
+draw_dataset_histotype_figure()
+
+grDevices::dev.off()
+
+
+############################################################
+## 22. Confirm that the files were created
+############################################################
+
+stopifnot(
+  file.exists(final_png),
+  
+  file.exists(final_pdf)
+)
+
+print(
+  normalizePath(
+    final_png,
+    
+    winslash = "/",
+    
+    mustWork = TRUE
+  )
+)
+
+print(
+  normalizePath(
+    final_pdf,
+    
+    winslash = "/",
+    
+    mustWork = TRUE
+  )
+)
+
+
+############################################################
+## 23. Open the final PNG
+############################################################
+
+browseURL(
+  normalizePath(
+    final_png,
+    
+    winslash = "/",
+    
+    mustWork = TRUE
+  )
+)
+
+
+############################################################
+# CREATE COMBINED THREE-PANEL FIGURE
+############################################################
+
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+
+stopifnot(
+  inherits(subtype_concordance_plot, "ggplot"),
+  !is.null(heatmap_result$gtable),
+  file.exists(final_png)
+)
+
+############################################################
+# Convert heatmap to a patchwork-compatible panel
+############################################################
+
+heatmap_panel <- patchwork::wrap_elements(
+  full = heatmap_result$gtable
+)
+
+############################################################
+# Convert the saved 3D UMAP image to a plot panel
+############################################################
+
+umap_panel <- cowplot::ggdraw() +
+  cowplot::draw_image(
+    final_png,
+    x = 0,
+    y = 0,
+    width = 1,
+    height = 1
+  ) +
+  theme(
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+############################################################
+# Remove the internal titles because panel tags identify them
+############################################################
+
+concordance_panel <- subtype_concordance_plot +
+  labs(title = NULL) +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+############################################################
+# Combine panels
+#
+# A: heatmap across the full upper row
+# B: effect-size concordance
+# C: three-dimensional UMAP
+############################################################
+
+combined_subtype_figure <-
+  heatmap_panel /
+  (
+    concordance_panel |
+      umap_panel
+  ) +
+  plot_layout(
+    heights = c(1.25, 1)
+  ) +
+  plot_annotation(
+    tag_levels = "A",
+    title = paste(
+      "Transcriptomic similarities and differences",
+      "between EnOC and OCCC"
+    ),
+    theme = theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 15,
+        hjust = 0.5
+      ),
+      plot.tag = element_text(
+        face = "bold",
+        size = 14
+      )
+    )
+  )
+
+print(combined_subtype_figure)
+
+output_dir <- paste0(
+  "C:/Users/Radwa/OneDrive/Desktop/MD - RSCH/",
+  "The PhD File/Brunel PhD/Bioinformatics/EAOC_Paper/",
+  "Biochemistry submission/First revesion/",
+  "Submission images"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+stopifnot(dir.exists(output_dir))
+
+combined_png <- file.path(
+  output_dir,
+  "Combined_EnOC_OCCC_analysis.png"
+)
+
+combined_pdf <- file.path(
+  output_dir,
+  "Combined_EnOC_OCCC_analysis.pdf"
+)
+
+ggsave(
+  filename = combined_png,
+  plot = combined_subtype_figure,
+  width = 15,
+  height = 13,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  filename = combined_pdf,
+  plot = combined_subtype_figure,
+  width = 15,
+  height = 13,
+  units = "in",
+  device = cairo_pdf,
+  bg = "white"
+)
+
+stopifnot(
+  file.exists(combined_png),
+  file.exists(combined_pdf)
+)
+
+print(normalizePath(combined_png, winslash = "/"))
+print(normalizePath(combined_pdf, winslash = "/"))
+
+
+#######################################################################################
+## mTOR complex gene analysis
+#####################################################################################
+
+############################################################
+## Dot plot of mTOR complex components and regulators
+## OCCC versus normal and EnOC versus normal
+############################################################
+
+
+############################################################
+## 1. Define mTOR complex-associated genes
+############################################################
+
+mtor_complex_genes <- c(
+  "MTOR",
+  "DEPTOR",
+  "RPTOR",
+  "RICTOR",
+  "MLST8",
+  "PRR5",
+  "AKT1S1",
+  "MAPKAP1"
+)
+
+
+############################################################
+## 2. Map gene symbols to Ensembl identifiers
+############################################################
+
+mtor_gene_mapping <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = mtor_complex_genes,
+  keytype = "SYMBOL",
+  columns = c(
+    "SYMBOL",
+    "ENSEMBL"
+  )
+) %>%
+  dplyr::filter(
+    !is.na(ENSEMBL)
+  ) %>%
+  dplyr::distinct(
+    SYMBOL,
+    ENSEMBL
+  ) %>%
+  dplyr::rename(
+    gene_symbol = SYMBOL,
+    ensembl_gene_id = ENSEMBL
+  )
+
+
+############################################################
+## 3. Prepare existing differential-expression results
+############################################################
+
+prepare_mtor_dotplot_results <- function(
+    results_object,
+    histotype_name
+) {
+  
+  results_df <- as.data.frame(
+    results_object
+  )
+  
+  if (
+    !"ensembl_gene_id" %in% names(
+      results_df
+    )
+  ) {
+    
+    results_df <- results_df %>%
+      tibble::rownames_to_column(
+        "ensembl_gene_id"
+      )
+    
+  }
+  
+  required_columns <- c(
+    "ensembl_gene_id",
+    "logFC",
+    "adj.P.Val"
+  )
+  
+  missing_columns <- setdiff(
+    required_columns,
+    names(
+      results_df
+    )
+  )
+  
+  if (
+    length(
+      missing_columns
+    ) > 0
+  ) {
+    
+    stop(
+      paste(
+        "Missing required columns for",
+        histotype_name,
+        ":",
+        paste(
+          missing_columns,
+          collapse = ", "
+        )
+      )
+    )
+    
+  }
+  
+  results_df %>%
+    dplyr::mutate(
+      ensembl_gene_id = sub(
+        "\\..*$",
+        "",
+        as.character(
+          ensembl_gene_id
+        )
+      ),
+      
+      logFC = as.numeric(
+        logFC
+      ),
+      
+      adjusted_P = as.numeric(
+        adj.P.Val
+      ),
+      
+      histotype = histotype_name,
+      
+      significance = dplyr::case_when(
+        is.na(adjusted_P) ~ NA_character_,
+        adjusted_P < 0.0001 ~ "****",
+        adjusted_P < 0.001 ~ "***",
+        adjusted_P < 0.01 ~ "**",
+        adjusted_P < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      
+      direction = dplyr::case_when(
+        logFC > 0 ~ "Upregulated",
+        logFC < 0 ~ "Downregulated",
+        TRUE ~ "No change"
+      )
+    ) %>%
+    dplyr::filter(
+      !is.na(ensembl_gene_id),
+      ensembl_gene_id != "",
+      is.finite(logFC),
+      !is.na(adjusted_P)
+    ) %>%
+    dplyr::arrange(
+      adjusted_P
+    ) %>%
+    dplyr::distinct(
+      ensembl_gene_id,
+      .keep_all = TRUE
+    ) %>%
+    dplyr::select(
+      ensembl_gene_id,
+      histotype,
+      logFC,
+      adjusted_P,
+      significance,
+      direction
+    )
+  
+}
+
+
+############################################################
+## 4. Prepare results for each histotype
+############################################################
+
+mtor_results_occc <- prepare_mtor_dotplot_results(
+  results_object = results_occc,
+  histotype_name = "OCCC"
+)
+
+mtor_results_enoc <- prepare_mtor_dotplot_results(
+  results_object = results_enoc,
+  histotype_name = "EnOC"
+)
+
+
+############################################################
+## 5. Combine results and retain selected mTOR genes
+############################################################
+
+mtor_dotplot_data <- dplyr::bind_rows(
+  mtor_results_occc,
+  mtor_results_enoc
+) %>%
+  dplyr::inner_join(
+    mtor_gene_mapping,
+    by = "ensembl_gene_id",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::arrange(
+    gene_symbol,
+    histotype,
+    adjusted_P
+  ) %>%
+  dplyr::distinct(
+    gene_symbol,
+    histotype,
+    .keep_all = TRUE
+  ) %>%
+  dplyr::mutate(
+    gene_symbol = factor(
+      gene_symbol,
+      levels = rev(
+        mtor_complex_genes
+      )
+    ),
+    
+    histotype = factor(
+      histotype,
+      levels = c(
+        "EnOC",
+        "OCCC"
+      )
+    )
+  )
+
+stopifnot(
+  nrow(
+    mtor_dotplot_data
+  ) > 0
+)
+
+
+############################################################
+## 6. Define point positioning
+############################################################
+
+mtor_dotplot_dodge <- ggplot2::position_dodge(
+  width = 0.65
+)
+
+
+############################################################
+## 7. Create the differential-expression dot plot
+############################################################
+
+mtor_dotplot <- ggplot2::ggplot(
+  mtor_dotplot_data,
+  ggplot2::aes(
+    x = logFC,
+    y = gene_symbol,
+    colour = histotype,
+    group = histotype
+  )
+) +
+  
+  ggplot2::geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey35",
+    linewidth = 0.7
+  ) +
+  
+  ggplot2::geom_point(
+    position = mtor_dotplot_dodge,
+    size = 4
+  ) +
+  
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = significance
+    ),
+    position = mtor_dotplot_dodge,
+    hjust = -0.6,
+    size = 4,
+    show.legend = FALSE
+  ) +
+  
+  ggplot2::scale_colour_manual(
+    values = c(
+      "EnOC" = "#0072B2",
+      "OCCC" = "#D55E00"
+    )
+  ) +
+  
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(
+      mult = c(
+        0.10,
+        0.25
+      )
+    )
+  ) +
+  
+  ggplot2::labs(
+    title = paste(
+      "Differential expression of mTOR complex",
+      "components and regulators"
+    ),
+    
+    x = expression(
+      log[2] ~ "fold change versus normal"
+    ),
+    
+    y = NULL,
+    
+    colour = "Histotype"
+  ) +
+  
+  ggplot2::theme_bw(
+    base_size = 12
+  ) +
+  
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    
+    axis.text.y = ggplot2::element_text(
+      face = "italic",
+      colour = "black",
+      size = 11
+    ),
+    
+    axis.text.x = ggplot2::element_text(
+      colour = "black"
+    ),
+    
+    panel.grid.major.y = ggplot2::element_line(
+      colour = "grey90"
+    ),
+    
+    panel.grid.major.x = ggplot2::element_line(
+      colour = "grey94"
+    ),
+    
+    panel.grid.minor = ggplot2::element_blank(),
+    
+    legend.position = "right"
+  )
+
+print(
+  mtor_dotplot
+)
+
+
+############################################################
+## 8. Save the dot plot
+############################################################
+
+stopifnot(
+  dir.exists(
+    output_dir
+  )
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "mTOR_complex_gene_dot_plot.png"
+  ),
+  plot = mtor_dotplot,
+  width = 9,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    "mTOR_complex_gene_dot_plot.pdf"
+  ),
+  plot = mtor_dotplot,
+  width = 9,
+  height = 6,
+  units = "in",
+  device = grDevices::cairo_pdf,
+  bg = "white"
+)
+
+
+############################################################
+## 9. Export the underlying data
+############################################################
+
+openxlsx::write.xlsx(
+  mtor_dotplot_data,
+  file = file.path(
+    output_dir,
+    "mTOR_complex_gene_dot_plot_data.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+
+
+
